@@ -1,0 +1,50 @@
+[project]
+name = "acadgraph"
+version = "0.1.0"
+description = "Three-Layer Evidence-Chain Knowledge Graph for Academic Papers"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+dependencies = [
+    "neo4j>=5.0",
+    "qdrant-client>=1.7",
+    "openai>=1.0",
+    "pydantic>=2.0",
+    "httpx>=0.25",
+    "python-dotenv>=1.0",
+    "tiktoken>=0.5",
+    "numpy>=1.24",
+    "rich>=13.0",
+    "click>=8.0",
+    "tenacity>=8.0",
+]
+
+[project.optional-dependencies]
+pdf = [
+    "marker-pdf>=1.0",
+    "pymupdf4llm>=0.0.5",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+acadgraph = "acadgraph.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
