@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol, Sequence, runtime_checkable
 
+from acadgraph.kg.ontology import RelationMetadata
 from acadgraph.kg.schema import (
     ArgumentationGraph,
     CitationEdge,
@@ -76,6 +77,13 @@ class KgRepository(Protocol):
     async def get_stats(self) -> dict[str, int]:
         """Get storage-level statistics."""
 
+    async def get_edges_by_source_rule(
+        self,
+        source_rule: str,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return relation edges carrying a specific source_rule metadata value."""
+
     async def paper_exists(self, paper_id: str) -> bool:
         """Check whether a paper exists."""
 
@@ -88,6 +96,7 @@ class KgRepository(Protocol):
         properties: dict[str, Any] | None = None,
         source_rule: str | None = None,
         confidence_source: str | None = None,
+        metadata: RelationMetadata | None = None,
     ) -> bool:
         """Create/merge a Paper->Entity relation edge."""
 
@@ -99,6 +108,7 @@ class KgRepository(Protocol):
         confidence: float = 0.7,
         source_rule: str | None = None,
         confidence_source: str | None = None,
+        metadata: RelationMetadata | None = None,
     ) -> bool:
         """Create/merge a METHOD->CLAIM cross-layer edge."""
 
@@ -111,6 +121,7 @@ class KgRepository(Protocol):
         source_rule: str | None = None,
         confidence_source: str | None = None,
         evidence_span: str | None = None,
+        metadata: RelationMetadata | None = None,
     ) -> bool:
         """Create/merge a DATASET->EVIDENCE cross-layer edge."""
 

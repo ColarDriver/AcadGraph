@@ -28,10 +28,8 @@ from acadgraph.kg.ontology import (
     KG_LAYER_L1,
     KG_LAYER_L2,
     KG_LAYER_L3,
-    REL_META_CONFIDENCE_SOURCE,
-    REL_META_EVIDENCE_SPAN,
-    REL_META_SOURCE_RULE,
-    normalize_evidence_span,
+    RelationMetadata,
+    make_relation_metadata,
     make_vector_payload,
 )
 from acadgraph.kg.extract.entities import EntityExtractor
@@ -52,15 +50,18 @@ class IncrementalKGBuilder:
     """Incremental knowledge graph builder."""
 
     @staticmethod
-    def _relation_meta_defaults(source_rule: str, confidence_source: str, evidence_span: str | None = None) -> dict[str, str]:
-        """Build normalized relation metadata keys using ontology constants."""
-        meta = {
-            REL_META_SOURCE_RULE: source_rule,
-            REL_META_CONFIDENCE_SOURCE: confidence_source,
-        }
-        if evidence_span is not None:
-            meta[REL_META_EVIDENCE_SPAN] = normalize_evidence_span(evidence_span)
-        return meta
+    def _relation_metadata(
+        *,
+        source_rule: str,
+        confidence_source: str,
+        evidence_span: str | None = None,
+    ) -> RelationMetadata:
+        """Create normalized relation metadata objects from ontology helpers."""
+        return make_relation_metadata(
+            source_rule=source_rule,
+            confidence_source=confidence_source,
+            evidence_span=evidence_span,
+        )
 
     def __init__(
         self,
@@ -173,7 +174,7 @@ class IncrementalKGBuilder:
             # Link Paper → entities
             for entity in entity_result.entities:
                 rel_type = self._paper_entity_relation_type(entity.entity_type.value)
-                metadata = self._relation_meta_defaults(
+                metadata = self._relation_metadata(
                     source_rule="ontology.paper_entity_relation",
                     confidence_source="builder.default",
                 )
@@ -183,8 +184,9 @@ class IncrementalKGBuilder:
                     entity_id=entity.entity_id,
                     relation_type=rel_type,
                     confidence=1.0,
-                    source_rule=metadata[REL_META_SOURCE_RULE],
-                    confidence_source=metadata[REL_META_CONFIDENCE_SOURCE],
+                    source_rule=metadata.source_rule,
+                    confidence_source=metadata.confidence_source,
+                    metadata=metadata,
                 )
                 if linked is None:
                     # Keep backward compatibility when using older store implementations.
@@ -632,7 +634,7 @@ class IncrementalKGBuilder:
                 if confidence <= 0:
                     continue
                 try:
-                    metadata = self._relation_meta_defaults(
+                    metadata = self._relation_metadata(
                         source_rule="heuristic.method_claim_overlap",
                         confidence_source="builder.heuristic",
                     )
@@ -642,8 +644,9 @@ class IncrementalKGBuilder:
                         claim_id=claim.claim_id,
                         source_paper_id=paper_id,
                         confidence=confidence,
-                        source_rule=metadata[REL_META_SOURCE_RULE],
-                        confidence_source=metadata[REL_META_CONFIDENCE_SOURCE],
+                        source_rule=metadata.source_rule,
+                        confidence_source=metadata.confidence_source,
+                        metadata=metadata,
                     )
                     if linked:
                         method_links += 1
@@ -661,7 +664,7 @@ class IncrementalKGBuilder:
                 if confidence <= 0:
                     continue
                 try:
-                    metadata = self._relation_meta_defaults(
+                    metadata = self._relation_metadata(
                         source_rule="heuristic.dataset_evidence_match",
                         confidence_source="builder.heuristic",
                         evidence_span=", ".join(evidence.datasets) if evidence.datasets else None,
@@ -672,9 +675,10 @@ class IncrementalKGBuilder:
                         evidence_id=evidence.evidence_id,
                         source_paper_id=paper_id,
                         confidence=confidence,
-                        source_rule=metadata[REL_META_SOURCE_RULE],
-                        confidence_source=metadata[REL_META_CONFIDENCE_SOURCE],
-                        evidence_span=metadata[REL_META_EVIDENCE_SPAN],
+                        source_rule=metadata.source_rule,
+                        confidence_source=metadata.confidence_source,
+                        evidence_span=metadata.evidence_span,
+                        metadata=metadata,
                     )
                     if linked:
                         dataset_links += 1

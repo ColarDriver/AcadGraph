@@ -4,6 +4,10 @@ import pytest
 
 from acadgraph.kg.ontology import (
     ALLOWED_PAPER_ENTITY_RELATIONS,
+    DEFAULT_CONFIDENCE_SOURCE,
+    DEFAULT_SOURCE_RULE,
+    RelationMetadata,
+    make_relation_metadata,
     normalize_evidence_span,
     validate_confidence,
     validate_paper_entity_relation,
@@ -199,3 +203,24 @@ def test_normalize_evidence_span_returns_unknown_for_empty_input():
     assert normalize_evidence_span("") == "unknown"
     assert normalize_evidence_span("   ") == "unknown"
     assert normalize_evidence_span(" table 2 ") == "table 2"
+
+
+def test_relation_metadata_normalizes_empty_tokens_and_span():
+    """RelationMetadata should normalize empty values to ontology defaults."""
+    meta = RelationMetadata(source_rule="  ", confidence_source="", evidence_span="   ")
+    assert meta.source_rule == DEFAULT_SOURCE_RULE
+    assert meta.confidence_source == DEFAULT_CONFIDENCE_SOURCE
+    assert meta.evidence_span == "unknown"
+
+
+def test_make_relation_metadata_builds_neo4j_param_payload():
+    """Metadata factory should produce stable Neo4j params."""
+    meta = make_relation_metadata(
+        source_rule="heuristic.dataset_evidence_match",
+        confidence_source="builder.heuristic",
+        evidence_span=" table 1 ",
+    )
+    params = meta.as_neo4j_params()
+    assert params["source_rule"] == "heuristic.dataset_evidence_match"
+    assert params["confidence_source"] == "builder.heuristic"
+    assert params["evidence_span"] == "table 1"

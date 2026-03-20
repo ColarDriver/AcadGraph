@@ -77,6 +77,30 @@ class _StubNeo4j:
             }
         ]
 
+    async def get_edges_by_source_rule(self, source_rule, limit=50):
+        if source_rule != "heuristic.method_claim_overlap":
+            return []
+        return [
+            {
+                "src_id": "method_1",
+                "dst_id": "claim_1",
+                "relation": "SUPPORTS_CLAIM",
+                "confidence": 0.8,
+                "source_rule": source_rule,
+                "confidence_source": "builder.heuristic",
+                "evidence_span": "unknown",
+            },
+            {
+                "src_id": "method_2",
+                "dst_id": "claim_2",
+                "relation": "SUPPORTS_CLAIM",
+                "confidence": 0.6,
+                "source_rule": source_rule,
+                "confidence_source": "builder.heuristic",
+                "evidence_span": "unknown",
+            },
+        ]
+
     # Methods needed by type checks/other flows but unused here.
     async def get_stats(self):
         return {}
@@ -134,6 +158,7 @@ def test_enhanced_recall_uses_doc_kind_filters():
     _ = asyncio.run(engine.enhanced_recall("new method", k=10))
 
     calls = engine.qdrant.calls
+    assert (ENTITY_COLLECTION, 10, {"doc_kind": DOC_KIND_ENTITY}) in calls
     assert (CLAIM_COLLECTION, 10, {"doc_kind": DOC_KIND_CLAIM}) in calls
     assert (ENTITY_COLLECTION, 10, {"doc_kind": DOC_KIND_SECTION}) in calls
 
@@ -147,3 +172,16 @@ def test_verify_claims_queries_evidence_with_doc_kind_filter():
     calls = engine.qdrant.calls
     assert (CLAIM_COLLECTION, 3, {"doc_kind": DOC_KIND_CLAIM}) in calls
     assert (CLAIM_COLLECTION, 3, {"doc_kind": DOC_KIND_EVIDENCE}) in calls
+
+
+def test_audit_edges_by_source_rule_returns_distribution_and_avg_confidence():
+    """Audit API should aggregate relation distribution and confidence stats."""
+    engine = _build_engine()
+
+    result = asyncio.run(engine.audit_edges_by_source_rule("heuristic.method_claim_overlap", limit=10))
+
+    assert result["source_rule"] == "heuristic.method_claim_overlap"
+    assert result["edge_count"] == 2
+    assert result["relation_type_distribution"]["SUPPORTS_CLAIM"] == 2
+    assert result["avg_confidence"] == 0.7
+    assert len(result["edges"]) == 2

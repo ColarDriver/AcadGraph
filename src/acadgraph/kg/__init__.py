@@ -15,9 +15,13 @@ __all__ = [
     "KG_LAYER_L1",
     "KG_LAYER_L2",
     "KG_LAYER_L3",
+    "RelationMetadata",
+    "make_relation_metadata",
 ]
 
 from acadgraph.kg.ontology import (
+    RelationMetadata,
+    make_relation_metadata,
     CLAIM_COLLECTION,
     ENTITY_COLLECTION,
     DOC_KIND_CLAIM,

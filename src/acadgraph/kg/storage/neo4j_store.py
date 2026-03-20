@@ -18,10 +18,11 @@ from neo4j import AsyncGraphDatabase, AsyncDriver
 from acadgraph.config import Neo4jConfig
 from acadgraph.kg.interfaces import KgRepository
 from acadgraph.kg.ontology import (
+    RelationMetadata,
+    make_relation_metadata,
     REL_META_CONFIDENCE_SOURCE,
     REL_META_EVIDENCE_SPAN,
     REL_META_SOURCE_RULE,
-    normalize_evidence_span,
     validate_confidence,
     validate_paper_entity_relation,
 )
@@ -195,6 +196,7 @@ class Neo4jKGStore(KgRepository):
         properties: dict[str, Any] | None = None,
         source_rule: str | None = None,
         confidence_source: str | None = None,
+        metadata: RelationMetadata | None = None,
     ) -> bool:
         """Create/merge an edge between Paper and entity."""
         if not validate_paper_entity_relation(relation_type):
@@ -211,12 +213,15 @@ class Neo4jKGStore(KgRepository):
             r.confidence_source = $confidence_source
         RETURN count(r) AS linked
         """
+        resolved = metadata or make_relation_metadata(
+            source_rule=source_rule or "ontology.paper_entity_relation",
+            confidence_source=confidence_source or "builder.default",
+        )
         params: dict[str, Any] = {
             "paper_id": paper_id,
             "entity_id": entity_id,
             "confidence": confidence,
-            REL_META_SOURCE_RULE: source_rule or "ontology.paper_entity_relation",
-            REL_META_CONFIDENCE_SOURCE: confidence_source or "builder.default",
+            **resolved.as_neo4j_params(),
         }
 
         if properties:
@@ -368,6 +373,7 @@ class Neo4jKGStore(KgRepository):
         confidence: float = 0.7,
         source_rule: str | None = None,
         confidence_source: str | None = None,
+        metadata: RelationMetadata | None = None,
     ) -> bool:
         """Create cross-layer METHOD -> CLAIM link."""
         if not validate_confidence(confidence):
@@ -384,14 +390,18 @@ class Neo4jKGStore(KgRepository):
             r.confidence_source = $confidence_source
         RETURN count(r) AS linked
         """
+        resolved = metadata or make_relation_metadata(
+            source_rule=source_rule or "heuristic.method_claim_overlap",
+            confidence_source=confidence_source or "builder.heuristic",
+        )
         async with self.driver.session() as session:
             result = await session.run(query, {
                 "method_id": method_id,
                 "claim_id": claim_id,
                 "source_paper_id": source_paper_id,
                 "confidence": confidence,
-                REL_META_SOURCE_RULE: source_rule or "heuristic.method_claim_overlap",
-                REL_META_CONFIDENCE_SOURCE: confidence_source or "builder.heuristic",
+                REL_META_SOURCE_RULE: resolved.source_rule,
+                REL_META_CONFIDENCE_SOURCE: resolved.confidence_source,
             })
             record = await result.single()
             return bool(record and record.get("linked", 0) > 0)
@@ -405,6 +415,7 @@ class Neo4jKGStore(KgRepository):
         source_rule: str | None = None,
         confidence_source: str | None = None,
         evidence_span: str | None = None,
+        metadata: RelationMetadata | None = None,
     ) -> bool:
         """Create cross-layer DATASET -> EVIDENCE link."""
         if not validate_confidence(confidence):
@@ -422,15 +433,20 @@ class Neo4jKGStore(KgRepository):
             r.evidence_span = $evidence_span
         RETURN count(r) AS linked
         """
+        resolved = metadata or make_relation_metadata(
+            source_rule=source_rule or "heuristic.dataset_evidence_match",
+            confidence_source=confidence_source or "builder.heuristic",
+            evidence_span=evidence_span or "datasets_field",
+        )
         async with self.driver.session() as session:
             result = await session.run(query, {
                 "dataset_id": dataset_id,
                 "evidence_id": evidence_id,
                 "source_paper_id": source_paper_id,
                 "confidence": confidence,
-                REL_META_SOURCE_RULE: source_rule or "heuristic.dataset_evidence_match",
-                REL_META_CONFIDENCE_SOURCE: confidence_source or "builder.heuristic",
-                REL_META_EVIDENCE_SPAN: normalize_evidence_span(evidence_span or "datasets_field"),
+                REL_META_SOURCE_RULE: resolved.source_rule,
+                REL_META_CONFIDENCE_SOURCE: resolved.confidence_source,
+                REL_META_EVIDENCE_SPAN: resolved.evidence_span,
             })
             record = await result.single()
             return bool(record and record.get("linked", 0) > 0)
@@ -823,6 +839,37 @@ class Neo4jKGStore(KgRepository):
         """
         async with self.driver.session() as session:
             result = await session.run(query, {"paper_ids": paper_ids, "k": k})
+            return await result.data()
+
+    async def get_edges_by_source_rule(
+        self,
+        source_rule: str,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return edges that are tagged with the given source_rule metadata."""
+        query = """
+        MATCH (src)-[r]->(dst)
+        WHERE r.source_rule = $source_rule
+        RETURN labels(src) AS src_labels,
+               coalesce(src.paper_id, src.entity_id, src.claim_id, src.evidence_id, '') AS src_id,
+               type(r) AS relation,
+               labels(dst) AS dst_labels,
+               coalesce(dst.paper_id, dst.entity_id, dst.claim_id, dst.evidence_id, '') AS dst_id,
+               r.confidence AS confidence,
+               r.source_rule AS source_rule,
+               r.confidence_source AS confidence_source,
+               r.evidence_span AS evidence_span
+        ORDER BY coalesce(r.confidence, 0.0) DESC
+        LIMIT $limit
+        """
+        async with self.driver.session() as session:
+            result = await session.run(
+                query,
+                {
+                    "source_rule": source_rule,
+                    "limit": max(1, int(limit)),
+                },
+            )
             return await result.data()
 
     async def get_stats(self) -> dict[str, int]:

@@ -345,7 +345,9 @@ Return JSON:
                     all_results[pid]["path_matches"][path_key].append(path_payload)
 
         # Path 1: Entity-based recall
-        entity_hits = await self.qdrant.search_similar(ENTITY_COLLECTION, idea_embedding, k=k)
+        entity_hits = await self.qdrant.search_similar(
+            ENTITY_COLLECTION, idea_embedding, k=k, filters={"doc_kind": DOC_KIND_ENTITY}
+        )
         for hit in entity_hits:
             payload = hit.get("payload", {})
             _upsert_result(
@@ -511,6 +513,36 @@ Return JSON:
                 }
                 for h in filtered_hits[:10]
             ],
+        }
+
+    async def audit_edges_by_source_rule(
+        self,
+        source_rule: str,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Audit graph edges produced by a specific extraction/linking rule."""
+        edges = await self.neo4j.get_edges_by_source_rule(source_rule, limit=limit)
+        relation_type_distribution: dict[str, int] = {}
+        avg_confidence = 0.0
+
+        confidence_values: list[float] = []
+        for edge in edges:
+            rel = edge.get("relation", "UNKNOWN")
+            relation_type_distribution[rel] = relation_type_distribution.get(rel, 0) + 1
+
+            conf = edge.get("confidence")
+            if isinstance(conf, (int, float)):
+                confidence_values.append(float(conf))
+
+        if confidence_values:
+            avg_confidence = sum(confidence_values) / len(confidence_values)
+
+        return {
+            "source_rule": source_rule,
+            "edge_count": len(edges),
+            "avg_confidence": avg_confidence,
+            "relation_type_distribution": relation_type_distribution,
+            "edges": edges,
         }
 
     # ========================================================================
