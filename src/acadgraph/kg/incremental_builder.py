@@ -9,6 +9,7 @@ concurrency control and shared deduplication caches.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 import time
@@ -16,6 +17,23 @@ from typing import Sequence
 
 from acadgraph.embedding_client import EmbeddingClient
 from acadgraph.kg.interfaces import KgRepository, VectorIndex
+from acadgraph.kg.ontology import (
+    CLAIM_COLLECTION,
+    ENTITY_COLLECTION,
+    DOC_KIND_CLAIM,
+    DOC_KIND_CITATION,
+    DOC_KIND_ENTITY,
+    DOC_KIND_EVIDENCE,
+    DOC_KIND_SECTION,
+    KG_LAYER_L1,
+    KG_LAYER_L2,
+    KG_LAYER_L3,
+    REL_META_CONFIDENCE_SOURCE,
+    REL_META_EVIDENCE_SPAN,
+    REL_META_SOURCE_RULE,
+    normalize_evidence_span,
+    make_vector_payload,
+)
 from acadgraph.kg.extract.entities import EntityExtractor
 from acadgraph.kg.extract.evolution import CitationEvolutionBuilder
 from acadgraph.kg.extract.argumentation import ArgumentationExtractor
@@ -32,6 +50,17 @@ logger = logging.getLogger(__name__)
 
 class IncrementalKGBuilder:
     """Incremental knowledge graph builder."""
+
+    @staticmethod
+    def _relation_meta_defaults(source_rule: str, confidence_source: str, evidence_span: str | None = None) -> dict[str, str]:
+        """Build normalized relation metadata keys using ontology constants."""
+        meta = {
+            REL_META_SOURCE_RULE: source_rule,
+            REL_META_CONFIDENCE_SOURCE: confidence_source,
+        }
+        if evidence_span is not None:
+            meta[REL_META_EVIDENCE_SPAN] = normalize_evidence_span(evidence_span)
+        return meta
 
     def __init__(
         self,
@@ -56,7 +85,22 @@ class IncrementalKGBuilder:
         method = getattr(self.neo4j, method_name, None)
         if method is None:
             return None
-        return await method(*args, **kwargs)
+
+        signature = inspect.signature(method)
+        accepts_var_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in signature.parameters.values()
+        )
+        if accepts_var_kwargs:
+            filtered_kwargs = kwargs
+        else:
+            filtered_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key in signature.parameters
+            }
+
+        return await method(*args, **filtered_kwargs)
 
     async def add_paper(self, paper_source: PaperSource) -> BuildResult:
         """
@@ -129,12 +173,18 @@ class IncrementalKGBuilder:
             # Link Paper → entities
             for entity in entity_result.entities:
                 rel_type = self._paper_entity_relation_type(entity.entity_type.value)
+                metadata = self._relation_meta_defaults(
+                    source_rule="ontology.paper_entity_relation",
+                    confidence_source="builder.default",
+                )
                 linked = await self._call_neo4j_optional(
                     "link_paper_entity",
                     paper_id=parsed.paper_id,
                     entity_id=entity.entity_id,
                     relation_type=rel_type,
                     confidence=1.0,
+                    source_rule=metadata[REL_META_SOURCE_RULE],
+                    confidence_source=metadata[REL_META_CONFIDENCE_SOURCE],
                 )
                 if linked is None:
                     # Keep backward compatibility when using older store implementations.
@@ -190,7 +240,7 @@ class IncrementalKGBuilder:
             result.relations_added += await self._build_method_evolution_links(
                 paper_id=parsed.paper_id,
                 paper_year=parsed.year,
-                l1_result=entity_result,
+                entity_result=entity_result,
             )
 
             # Store claim and evidence embeddings in Qdrant
@@ -284,15 +334,19 @@ class IncrementalKGBuilder:
         embeddings = await self.embedding.embed_batch(texts)
         ids = [e.entity_id for e in entities]
         payloads = [
-            {
-                "entity_type": e.entity_type.value,
-                "name": e.name,
-                "paper_id": e.source_paper_id,
-            }
+            make_vector_payload(
+                doc_kind=DOC_KIND_ENTITY,
+                kg_layer=KG_LAYER_L1,
+                base={
+                    "entity_type": e.entity_type.value,
+                    "name": e.name,
+                    "paper_id": e.source_paper_id,
+                },
+            )
             for e in entities
         ]
         await self.qdrant.upsert_embeddings_batch(
-            "entities", ids, embeddings, payloads
+            ENTITY_COLLECTION, ids, embeddings, payloads
         )
 
     async def _store_citation_embeddings(self, citations: list) -> None:
@@ -306,16 +360,21 @@ class IncrementalKGBuilder:
         embeddings = await self.embedding.embed_batch(texts)
         ids = [f"cite_{c.citing_paper_id}_{i}" for i, c in enumerate(valid)]
         payloads = [
-            {
-                "citing_paper_id": c.citing_paper_id,
-                "cited_paper_id": c.cited_paper_id,
-                "intent": c.intent.value,
-                "section": c.section,
-            }
+            make_vector_payload(
+                doc_kind=DOC_KIND_CITATION,
+                kg_layer=KG_LAYER_L2,
+                base={
+                    "citing_paper_id": c.citing_paper_id,
+                    "paper_id": c.citing_paper_id,
+                    "cited_paper_id": c.cited_paper_id,
+                    "intent": c.intent.value,
+                    "section": c.section,
+                },
+            )
             for c in valid
         ]
         await self.qdrant.upsert_embeddings_batch(
-            "claims", ids, embeddings, payloads
+            CLAIM_COLLECTION, ids, embeddings, payloads
         )
 
     async def _store_argumentation_embeddings(self, arg_graph) -> None:
@@ -326,15 +385,19 @@ class IncrementalKGBuilder:
             embeddings = await self.embedding.embed_batch(texts)
             ids = [c.claim_id for c in arg_graph.claims]
             payloads = [
-                {
-                    "paper_id": c.source_paper_id,
-                    "claim_type": c.claim_type.value,
-                    "severity": c.severity.value,
-                }
+                make_vector_payload(
+                    doc_kind=DOC_KIND_CLAIM,
+                    kg_layer=KG_LAYER_L3,
+                    base={
+                        "paper_id": c.source_paper_id,
+                        "claim_type": c.claim_type.value,
+                        "severity": c.severity.value,
+                    },
+                )
                 for c in arg_graph.claims
             ]
             await self.qdrant.upsert_embeddings_batch(
-                "claims", ids, embeddings, payloads
+                CLAIM_COLLECTION, ids, embeddings, payloads
             )
 
         # Evidence
@@ -345,14 +408,18 @@ class IncrementalKGBuilder:
                 embeddings = await self.embedding.embed_batch(texts)
                 ids = [e.evidence_id for e in valid_evidences]
                 payloads = [
-                    {
-                        "paper_id": e.source_paper_id,
-                        "evidence_type": e.evidence_type.value,
-                    }
+                    make_vector_payload(
+                        doc_kind=DOC_KIND_EVIDENCE,
+                        kg_layer=KG_LAYER_L3,
+                        base={
+                            "paper_id": e.source_paper_id,
+                            "evidence_type": e.evidence_type.value,
+                        },
+                    )
                     for e in valid_evidences
                 ]
                 await self.qdrant.upsert_embeddings_batch(
-                    "claims", ids, embeddings, payloads
+                    CLAIM_COLLECTION, ids, embeddings, payloads
                 )
 
     async def _store_section_embeddings(self, parsed_paper) -> None:
@@ -369,15 +436,19 @@ class IncrementalKGBuilder:
         embeddings = await self.embedding.embed_batch(texts)
         ids = [f"sec_{parsed_paper.paper_id}_{name}" for name, _ in sections]
         payloads = [
-            {
-                "paper_id": parsed_paper.paper_id,
-                "section": name,
-                "title": parsed_paper.title,
-            }
+            make_vector_payload(
+                doc_kind=DOC_KIND_SECTION,
+                kg_layer=KG_LAYER_L1,
+                base={
+                    "paper_id": parsed_paper.paper_id,
+                    "section": name,
+                    "title": parsed_paper.title,
+                },
+            )
             for name, _ in sections
         ]
         await self.qdrant.upsert_embeddings_batch(
-            "entities", ids, embeddings, payloads
+            ENTITY_COLLECTION, ids, embeddings, payloads
         )
 
     # ========================================================================
@@ -396,12 +467,12 @@ class IncrementalKGBuilder:
         self,
         paper_id: str,
         paper_year: int | None,
-        l1_result,
+        entity_result,
     ) -> int:
         """Build and persist EVOLVES_FROM links using current + historical methods."""
         current_method_ids = {
             e.entity_id
-            for e in l1_result.entities
+            for e in entity_result.entities
             if e.entity_type.value == "METHOD"
         }
         if not current_method_ids:
@@ -535,7 +606,7 @@ class IncrementalKGBuilder:
 
         return best_conf
 
-    async def _cross_layer_link(self, paper_id: str, l1_result, arg_graph) -> None:
+    async def _cross_layer_link(self, paper_id: str, entity_result, arg_graph) -> None:
         """
         Create cross-layer links:
         - METHOD -> CLAIM via lexical overlap in claim text.
@@ -546,12 +617,12 @@ class IncrementalKGBuilder:
 
         methods = [
             entity
-            for entity in l1_result.entities
+            for entity in entity_result.entities
             if entity.entity_type.value == "METHOD"
         ]
         datasets = [
             entity
-            for entity in l1_result.entities
+            for entity in entity_result.entities
             if entity.entity_type.value == "DATASET"
         ]
 
@@ -561,12 +632,18 @@ class IncrementalKGBuilder:
                 if confidence <= 0:
                     continue
                 try:
+                    metadata = self._relation_meta_defaults(
+                        source_rule="heuristic.method_claim_overlap",
+                        confidence_source="builder.heuristic",
+                    )
                     linked = await self._call_neo4j_optional(
                         "link_method_claim",
                         method_id=method.entity_id,
                         claim_id=claim.claim_id,
                         source_paper_id=paper_id,
                         confidence=confidence,
+                        source_rule=metadata[REL_META_SOURCE_RULE],
+                        confidence_source=metadata[REL_META_CONFIDENCE_SOURCE],
                     )
                     if linked:
                         method_links += 1
@@ -584,12 +661,20 @@ class IncrementalKGBuilder:
                 if confidence <= 0:
                     continue
                 try:
+                    metadata = self._relation_meta_defaults(
+                        source_rule="heuristic.dataset_evidence_match",
+                        confidence_source="builder.heuristic",
+                        evidence_span=", ".join(evidence.datasets) if evidence.datasets else None,
+                    )
                     linked = await self._call_neo4j_optional(
                         "link_dataset_evidence",
                         dataset_id=dataset.entity_id,
                         evidence_id=evidence.evidence_id,
                         source_paper_id=paper_id,
                         confidence=confidence,
+                        source_rule=metadata[REL_META_SOURCE_RULE],
+                        confidence_source=metadata[REL_META_CONFIDENCE_SOURCE],
+                        evidence_span=metadata[REL_META_EVIDENCE_SPAN],
                     )
                     if linked:
                         dataset_links += 1

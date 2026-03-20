@@ -23,13 +23,14 @@ from qdrant_client.models import (
 
 from acadgraph.config import QdrantConfig
 from acadgraph.kg.interfaces import VectorIndex
+from acadgraph.kg.ontology import CLAIM_COLLECTION, ENTITY_COLLECTION
 
 logger = logging.getLogger(__name__)
 
 # Collection definitions
 COLLECTIONS = {
-    "entities": "METHOD, DATASET, METRIC, TASK, MODEL, FRAMEWORK, CONCEPT embeddings",
-    "claims": "Claim text embeddings",
+    ENTITY_COLLECTION: "METHOD, DATASET, METRIC, TASK, MODEL, FRAMEWORK, CONCEPT embeddings",
+    CLAIM_COLLECTION: "Claim text embeddings",
 }
 
 

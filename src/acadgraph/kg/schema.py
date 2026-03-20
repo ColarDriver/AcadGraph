@@ -1,9 +1,9 @@
 """
 AcadGraph Schema — All data structures for the Three-Layer Evidence-Chain KG.
 
-Layer 1: Semantic Entities (METHOD, DATASET, METRIC, TASK, MODEL, FRAMEWORK, CONCEPT)
-Layer 2: Citation Relations & Evolution Chains
-Layer 3: Argumentation Chains (PROBLEM → GAP → CORE_IDEA → CLAIM → EVIDENCE)
+Semantic Entities: METHOD, DATASET, METRIC, TASK, MODEL, FRAMEWORK, CONCEPT
+Citation Relations & Evolution Chains
+Argumentation Chains: PROBLEM → GAP → CORE_IDEA → CLAIM → EVIDENCE
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ class ParsedPaper:
 
 
 # ============================================================================
-# Layer 1: Semantic Entities
+# Semantic Entities
 # ============================================================================
 
 
@@ -106,7 +106,7 @@ class EntityType(str, Enum):
 
 @dataclass
 class Entity:
-    """A Layer 1 semantic entity."""
+    """A semantic entity extracted from academic papers."""
     entity_id: str = ""
     entity_type: EntityType = EntityType.CONCEPT
     name: str = ""
@@ -125,7 +125,7 @@ class Entity:
 
 
 class RelationType(str, Enum):
-    """Relations between Layer 1 entities."""
+    """Relations between semantic entities."""
     APPLIED_ON = "APPLIED_ON"          # Method → Task
     EVALUATED_ON = "EVALUATED_ON"      # Method → Dataset
     MEASURED_BY = "MEASURED_BY"        # Method → Metric
@@ -158,7 +158,7 @@ class EntityExtractionResult:
 
 
 # ============================================================================
-# Layer 2: Citation Relations & Evolution Chains
+# Citation Relations & Evolution Chains
 # ============================================================================
 
 
@@ -206,12 +206,12 @@ class EvolutionChain:
 
 
 # ============================================================================
-# Layer 3: Argumentation Chains
+# Argumentation Chains
 # ============================================================================
 
 
 class RhetoricalRole(str, Enum):
-    """Rhetorical role for argumentative zoning (Pass 1)."""
+    """Rhetorical role for argumentative zoning."""
     MOTIVATION = "MOTIVATION"
     BACKGROUND = "BACKGROUND"
     CONTRIBUTION = "CONTRIBUTION"
@@ -233,7 +233,7 @@ class ZonedParagraph:
 
 @dataclass
 class ZonedPaper:
-    """Output of Pass 1 — rhetorical zoning."""
+    """Output of rhetorical zoning."""
     paper_id: str = ""
     paragraphs: list[ZonedParagraph] = field(default_factory=list)
 
@@ -400,7 +400,7 @@ class ClaimEvidenceLink:
 
 @dataclass
 class ArgumentationGraph:
-    """Full argumentation graph for one paper (Layer 3 output)."""
+    """Full argumentation graph for one paper."""
     paper_id: str = ""
     problems: list[Problem] = field(default_factory=list)
     gaps: list[Gap] = field(default_factory=list)

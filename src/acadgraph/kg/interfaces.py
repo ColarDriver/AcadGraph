@@ -79,6 +79,41 @@ class KgRepository(Protocol):
     async def paper_exists(self, paper_id: str) -> bool:
         """Check whether a paper exists."""
 
+    async def link_paper_entity(
+        self,
+        paper_id: str,
+        entity_id: str,
+        relation_type: str,
+        confidence: float = 1.0,
+        properties: dict[str, Any] | None = None,
+        source_rule: str | None = None,
+        confidence_source: str | None = None,
+    ) -> bool:
+        """Create/merge a Paper->Entity relation edge."""
+
+    async def link_method_claim(
+        self,
+        method_id: str,
+        claim_id: str,
+        source_paper_id: str,
+        confidence: float = 0.7,
+        source_rule: str | None = None,
+        confidence_source: str | None = None,
+    ) -> bool:
+        """Create/merge a METHOD->CLAIM cross-layer edge."""
+
+    async def link_dataset_evidence(
+        self,
+        dataset_id: str,
+        evidence_id: str,
+        source_paper_id: str,
+        confidence: float = 0.9,
+        source_rule: str | None = None,
+        confidence_source: str | None = None,
+        evidence_span: str | None = None,
+    ) -> bool:
+        """Create/merge a DATASET->EVIDENCE cross-layer edge."""
+
 
 @runtime_checkable
 class VectorIndex(Protocol):

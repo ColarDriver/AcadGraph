@@ -1,21 +1,30 @@
 """
-Neo4j graph storage for the Three-Layer KG.
+Neo4j graph storage for the academic KG.
 
 Manages CRUD operations for all three layers of the knowledge graph:
-- Layer 1: Semantic entities and their relations
-- Layer 2: Citation edges with intent
-- Layer 3: Argumentation chains (Problem → Gap → Claim → Evidence)
+- Semantic entities and their relations
+- Citation edges with intent
+- Argumentation chains (Problem → Gap → Claim → Evidence)
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from neo4j import AsyncGraphDatabase, AsyncDriver
 
 from acadgraph.config import Neo4jConfig
 from acadgraph.kg.interfaces import KgRepository
+from acadgraph.kg.ontology import (
+    REL_META_CONFIDENCE_SOURCE,
+    REL_META_EVIDENCE_SPAN,
+    REL_META_SOURCE_RULE,
+    normalize_evidence_span,
+    validate_confidence,
+    validate_paper_entity_relation,
+)
 from acadgraph.kg.schema import (
     ArgumentationGraph,
     Baseline,
@@ -35,6 +44,9 @@ from acadgraph.kg.schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Regex for validating safe Neo4j property keys (prevents Cypher injection)
+_SAFE_PROPERTY_KEY = re.compile(r"^[a-z_][a-z0-9_]*$", re.IGNORECASE)
 
 
 class Neo4jKGStore(KgRepository):
@@ -70,7 +82,7 @@ class Neo4jKGStore(KgRepository):
     async def init_schema(self) -> None:
         """Create constraints, indexes, and fulltext indexes."""
         queries = [
-            # Layer 1 constraints
+            # Entity constraints
             "CREATE CONSTRAINT IF NOT EXISTS FOR (m:Method) REQUIRE m.entity_id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (d:Dataset) REQUIRE d.entity_id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Task) REQUIRE t.entity_id IS UNIQUE",
@@ -80,7 +92,7 @@ class Neo4jKGStore(KgRepository):
             "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Concept) REQUIRE c.entity_id IS UNIQUE",
             # Paper constraint
             "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Paper) REQUIRE p.paper_id IS UNIQUE",
-            # Layer 3 constraints
+            # Argumentation constraints
             "CREATE CONSTRAINT IF NOT EXISTS FOR (pr:Problem) REQUIRE pr.problem_id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (g:Gap) REQUIRE g.gap_id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (ci:CoreIdea) REQUIRE ci.idea_id IS UNIQUE",
@@ -103,22 +115,14 @@ class Neo4jKGStore(KgRepository):
         logger.info("Neo4j schema initialized")
 
     # ========================================================================
-    # Layer 1: Entities
+    # Entities
     # ========================================================================
 
     async def upsert_entity(self, entity: Entity) -> str:
-        """Insert or update a Layer 1 entity. Returns entity_id."""
+        """Insert or update a semantic entity. Returns entity_id."""
         label = entity.entity_type.value.capitalize()
-        query = f"""
-        MERGE (e:{label} {{entity_id: $entity_id}})
-        SET e.name = $name,
-            e.description = $description,
-            e.source_paper_id = $source_paper_id,
-            e.source_section = $source_section,
-            e.confidence = $confidence
-        RETURN e.entity_id AS id
-        """
-        params = {
+
+        params: dict[str, Any] = {
             "entity_id": entity.entity_id,
             "name": entity.name,
             "description": entity.description,
@@ -126,14 +130,32 @@ class Neo4jKGStore(KgRepository):
             "source_section": entity.source_section,
             "confidence": entity.confidence,
         }
-        # Add custom attributes
+
+        # Build extra SET clauses from custom attributes (with safe key validation)
+        extra_sets: list[str] = []
         for k, v in entity.attributes.items():
-            if isinstance(v, (str, int, float, bool)):
-                params[k] = v
-                query = query.replace(
-                    "RETURN e.entity_id AS id",
-                    f"SET e.{k} = ${k}\nRETURN e.entity_id AS id",
-                )
+            if not isinstance(v, (str, int, float, bool)):
+                continue
+            if not _SAFE_PROPERTY_KEY.match(k):
+                logger.warning("Skipping unsafe attribute key: %r", k)
+                continue
+            params[f"attr_{k}"] = v
+            extra_sets.append(f"e.{k} = $attr_{k}")
+
+        extra_clause = ""
+        if extra_sets:
+            extra_clause = "SET " + ", ".join(extra_sets)
+
+        query = f"""
+        MERGE (e:{label} {{entity_id: $entity_id}})
+        SET e.name = $name,
+            e.description = $description,
+            e.source_paper_id = $source_paper_id,
+            e.source_section = $source_section,
+            e.confidence = $confidence
+        {extra_clause}
+        RETURN e.entity_id AS id
+        """
 
         async with self.driver.session() as session:
             result = await session.run(query, params)
@@ -171,20 +193,30 @@ class Neo4jKGStore(KgRepository):
         relation_type: str,
         confidence: float = 1.0,
         properties: dict[str, Any] | None = None,
+        source_rule: str | None = None,
+        confidence_source: str | None = None,
     ) -> bool:
         """Create/merge an edge between Paper and entity."""
+        if not validate_paper_entity_relation(relation_type):
+            logger.warning("Rejected invalid Paper->Entity relation_type: %s", relation_type)
+            return False
+
         query = f"""
         MATCH (p:Paper {{paper_id: $paper_id}})
         MATCH (e {{entity_id: $entity_id}})
         MERGE (p)-[r:{relation_type}]->(e)
         SET r.source_paper_id = $paper_id,
-            r.confidence = $confidence
+            r.confidence = $confidence,
+            r.source_rule = $source_rule,
+            r.confidence_source = $confidence_source
         RETURN count(r) AS linked
         """
         params: dict[str, Any] = {
             "paper_id": paper_id,
             "entity_id": entity_id,
             "confidence": confidence,
+            REL_META_SOURCE_RULE: source_rule or "ontology.paper_entity_relation",
+            REL_META_CONFIDENCE_SOURCE: confidence_source or "builder.default",
         }
 
         if properties:
@@ -221,7 +253,7 @@ class Neo4jKGStore(KgRepository):
             })
 
     # ========================================================================
-    # Layer 2: Citations
+    # Citations
     # ========================================================================
 
     async def add_citation(self, edge: CitationEdge) -> bool:
@@ -334,14 +366,22 @@ class Neo4jKGStore(KgRepository):
         claim_id: str,
         source_paper_id: str,
         confidence: float = 0.7,
+        source_rule: str | None = None,
+        confidence_source: str | None = None,
     ) -> bool:
         """Create cross-layer METHOD -> CLAIM link."""
+        if not validate_confidence(confidence):
+            logger.warning("Rejected METHOD->CLAIM with out-of-range confidence: %s", confidence)
+            return False
+
         query = """
         MATCH (m:Method {entity_id: $method_id})
         MATCH (c:Claim {claim_id: $claim_id})
         MERGE (m)-[r:SUPPORTS_CLAIM]->(c)
         SET r.source_paper_id = $source_paper_id,
-            r.confidence = $confidence
+            r.confidence = $confidence,
+            r.source_rule = $source_rule,
+            r.confidence_source = $confidence_source
         RETURN count(r) AS linked
         """
         async with self.driver.session() as session:
@@ -350,6 +390,8 @@ class Neo4jKGStore(KgRepository):
                 "claim_id": claim_id,
                 "source_paper_id": source_paper_id,
                 "confidence": confidence,
+                REL_META_SOURCE_RULE: source_rule or "heuristic.method_claim_overlap",
+                REL_META_CONFIDENCE_SOURCE: confidence_source or "builder.heuristic",
             })
             record = await result.single()
             return bool(record and record.get("linked", 0) > 0)
@@ -360,14 +402,24 @@ class Neo4jKGStore(KgRepository):
         evidence_id: str,
         source_paper_id: str,
         confidence: float = 0.9,
+        source_rule: str | None = None,
+        confidence_source: str | None = None,
+        evidence_span: str | None = None,
     ) -> bool:
         """Create cross-layer DATASET -> EVIDENCE link."""
+        if not validate_confidence(confidence):
+            logger.warning("Rejected DATASET->EVIDENCE with out-of-range confidence: %s", confidence)
+            return False
+
         query = """
         MATCH (d:Dataset {entity_id: $dataset_id})
         MATCH (e:Evidence {evidence_id: $evidence_id})
         MERGE (d)-[r:USED_IN_EVIDENCE]->(e)
         SET r.source_paper_id = $source_paper_id,
-            r.confidence = $confidence
+            r.confidence = $confidence,
+            r.source_rule = $source_rule,
+            r.confidence_source = $confidence_source,
+            r.evidence_span = $evidence_span
         RETURN count(r) AS linked
         """
         async with self.driver.session() as session:
@@ -376,6 +428,9 @@ class Neo4jKGStore(KgRepository):
                 "evidence_id": evidence_id,
                 "source_paper_id": source_paper_id,
                 "confidence": confidence,
+                REL_META_SOURCE_RULE: source_rule or "heuristic.dataset_evidence_match",
+                REL_META_CONFIDENCE_SOURCE: confidence_source or "builder.heuristic",
+                REL_META_EVIDENCE_SPAN: normalize_evidence_span(evidence_span or "datasets_field"),
             })
             record = await result.single()
             return bool(record and record.get("linked", 0) > 0)
@@ -410,177 +465,246 @@ class Neo4jKGStore(KgRepository):
             ]
 
     # ========================================================================
-    # Layer 3: Argumentation
+    # Argumentation
     # ========================================================================
 
     async def store_argumentation(self, paper_id: str, arg: ArgumentationGraph) -> None:
-        """Store the full argumentation graph for a paper."""
+        """Store the full argumentation graph for a paper.
+
+        Uses Cypher UNWIND for batch writes to minimize round-trips.
+        """
+        import json as _json
+
         async with self.driver.session() as session:
-            # Problems
-            for prob in arg.problems:
+            # ---- Problems (batch) ----
+            if arg.problems:
                 await session.run("""
-                    MERGE (pr:Problem {problem_id: $problem_id})
-                    SET pr.description = $description,
-                        pr.scope = $scope,
-                        pr.importance_signal = $importance_signal,
+                    UNWIND $items AS item
+                    MERGE (pr:Problem {problem_id: item.problem_id})
+                    SET pr.description = item.description,
+                        pr.scope = item.scope,
+                        pr.importance_signal = item.importance_signal,
                         pr.source_paper_id = $paper_id
                     WITH pr
                     MATCH (p:Paper {paper_id: $paper_id})
                     MERGE (p)-[:HAS_PROBLEM]->(pr)
                 """, {
-                    "problem_id": prob.problem_id,
-                    "description": prob.description,
-                    "scope": prob.scope,
-                    "importance_signal": prob.importance_signal,
                     "paper_id": paper_id,
+                    "items": [
+                        {
+                            "problem_id": prob.problem_id,
+                            "description": prob.description,
+                            "scope": prob.scope,
+                            "importance_signal": prob.importance_signal,
+                        }
+                        for prob in arg.problems
+                    ],
                 })
 
-            # Gaps
-            for gap in arg.gaps:
+            # ---- Gaps (batch) ----
+            if arg.gaps:
                 await session.run("""
-                    MERGE (g:Gap {gap_id: $gap_id})
-                    SET g.failure_mode = $failure_mode,
-                        g.constraint = $constraint,
-                        g.prior_methods_failing = $prior_methods,
+                    UNWIND $items AS item
+                    MERGE (g:Gap {gap_id: item.gap_id})
+                    SET g.failure_mode = item.failure_mode,
+                        g.constraint = item.constraint,
+                        g.prior_methods_failing = item.prior_methods,
                         g.source_paper_id = $paper_id
                 """, {
-                    "gap_id": gap.gap_id,
-                    "failure_mode": gap.failure_mode,
-                    "constraint": gap.constraint,
-                    "prior_methods": gap.prior_methods_failing,
                     "paper_id": paper_id,
+                    "items": [
+                        {
+                            "gap_id": gap.gap_id,
+                            "failure_mode": gap.failure_mode,
+                            "constraint": gap.constraint,
+                            "prior_methods": gap.prior_methods_failing,
+                        }
+                        for gap in arg.gaps
+                    ],
                 })
 
-            # Link Problem → Gap
+            # ---- Problem → Gap links (batch cartesian) ----
             if arg.problems and arg.gaps:
-                for prob in arg.problems:
-                    for gap in arg.gaps:
-                        await session.run("""
-                            MATCH (pr:Problem {problem_id: $prob_id})
-                            MATCH (g:Gap {gap_id: $gap_id})
-                            MERGE (pr)-[:HAS_GAP]->(g)
-                        """, {"prob_id": prob.problem_id, "gap_id": gap.gap_id})
-
-            # Core Ideas
-            for idea in arg.core_ideas:
+                pairs = [
+                    {"prob_id": p.problem_id, "gap_id": g.gap_id}
+                    for p in arg.problems
+                    for g in arg.gaps
+                ]
                 await session.run("""
-                    MERGE (ci:CoreIdea {idea_id: $idea_id})
-                    SET ci.mechanism = $mechanism,
-                        ci.novelty_type = $novelty_type,
-                        ci.key_innovation = $key_innovation,
+                    UNWIND $pairs AS pair
+                    MATCH (pr:Problem {problem_id: pair.prob_id})
+                    MATCH (g:Gap {gap_id: pair.gap_id})
+                    MERGE (pr)-[:HAS_GAP]->(g)
+                """, {"pairs": pairs})
+
+            # ---- Core Ideas (batch) ----
+            if arg.core_ideas:
+                await session.run("""
+                    UNWIND $items AS item
+                    MERGE (ci:CoreIdea {idea_id: item.idea_id})
+                    SET ci.mechanism = item.mechanism,
+                        ci.novelty_type = item.novelty_type,
+                        ci.key_innovation = item.key_innovation,
                         ci.source_paper_id = $paper_id
                 """, {
-                    "idea_id": idea.idea_id,
-                    "mechanism": idea.mechanism,
-                    "novelty_type": idea.novelty_type.value,
-                    "key_innovation": idea.key_innovation,
                     "paper_id": paper_id,
+                    "items": [
+                        {
+                            "idea_id": idea.idea_id,
+                            "mechanism": idea.mechanism,
+                            "novelty_type": idea.novelty_type.value,
+                            "key_innovation": idea.key_innovation,
+                        }
+                        for idea in arg.core_ideas
+                    ],
                 })
 
-            # Link Gap → CoreIdea
+            # ---- Gap → CoreIdea links (batch cartesian) ----
             if arg.gaps and arg.core_ideas:
-                for gap in arg.gaps:
-                    for idea in arg.core_ideas:
-                        await session.run("""
-                            MATCH (g:Gap {gap_id: $gap_id})
-                            MATCH (ci:CoreIdea {idea_id: $idea_id})
-                            MERGE (g)-[:ADDRESSED_BY]->(ci)
-                        """, {"gap_id": gap.gap_id, "idea_id": idea.idea_id})
-
-            # Claims
-            for claim in arg.claims:
+                pairs = [
+                    {"gap_id": g.gap_id, "idea_id": i.idea_id}
+                    for g in arg.gaps
+                    for i in arg.core_ideas
+                ]
                 await session.run("""
-                    MERGE (cl:Claim {claim_id: $claim_id})
-                    SET cl.text = $text,
-                        cl.claim_type = $claim_type,
-                        cl.severity = $severity,
-                        cl.source_section = $source_section,
-                        cl.claim_hash = $claim_hash,
+                    UNWIND $pairs AS pair
+                    MATCH (g:Gap {gap_id: pair.gap_id})
+                    MATCH (ci:CoreIdea {idea_id: pair.idea_id})
+                    MERGE (g)-[:ADDRESSED_BY]->(ci)
+                """, {"pairs": pairs})
+
+            # ---- Claims (batch) ----
+            if arg.claims:
+                await session.run("""
+                    UNWIND $items AS item
+                    MERGE (cl:Claim {claim_id: item.claim_id})
+                    SET cl.text = item.text,
+                        cl.claim_type = item.claim_type,
+                        cl.severity = item.severity,
+                        cl.source_section = item.source_section,
+                        cl.claim_hash = item.claim_hash,
                         cl.source_paper_id = $paper_id
                 """, {
-                    "claim_id": claim.claim_id,
-                    "text": claim.text,
-                    "claim_type": claim.claim_type.value,
-                    "severity": claim.severity.value,
-                    "source_section": claim.source_section,
-                    "claim_hash": claim.claim_hash,
                     "paper_id": paper_id,
+                    "items": [
+                        {
+                            "claim_id": claim.claim_id,
+                            "text": claim.text,
+                            "claim_type": claim.claim_type.value,
+                            "severity": claim.severity.value,
+                            "source_section": claim.source_section,
+                            "claim_hash": claim.claim_hash,
+                        }
+                        for claim in arg.claims
+                    ],
                 })
 
-            # Link CoreIdea → Claim
+            # ---- CoreIdea → Claim links (batch cartesian) ----
             if arg.core_ideas and arg.claims:
-                for idea in arg.core_ideas:
-                    for claim in arg.claims:
-                        await session.run("""
-                            MATCH (ci:CoreIdea {idea_id: $idea_id})
-                            MATCH (cl:Claim {claim_id: $claim_id})
-                            MERGE (ci)-[:MAKES_CLAIM]->(cl)
-                        """, {"idea_id": idea.idea_id, "claim_id": claim.claim_id})
-
-            # Evidence
-            for evid in arg.evidences:
+                pairs = [
+                    {"idea_id": i.idea_id, "claim_id": c.claim_id}
+                    for i in arg.core_ideas
+                    for c in arg.claims
+                ]
                 await session.run("""
-                    MERGE (e:Evidence {evidence_id: $evidence_id})
-                    SET e.evidence_type = $evidence_type,
-                        e.result_summary = $result_summary,
-                        e.datasets = $datasets,
-                        e.metrics = $metrics,
+                    UNWIND $pairs AS pair
+                    MATCH (ci:CoreIdea {idea_id: pair.idea_id})
+                    MATCH (cl:Claim {claim_id: pair.claim_id})
+                    MERGE (ci)-[:MAKES_CLAIM]->(cl)
+                """, {"pairs": pairs})
+
+            # ---- Evidence (batch) — includes numeric_results ----
+            if arg.evidences:
+                await session.run("""
+                    UNWIND $items AS item
+                    MERGE (e:Evidence {evidence_id: item.evidence_id})
+                    SET e.evidence_type = item.evidence_type,
+                        e.result_summary = item.result_summary,
+                        e.datasets = item.datasets,
+                        e.metrics = item.metrics,
+                        e.numeric_results = item.numeric_results,
                         e.source_paper_id = $paper_id
                 """, {
-                    "evidence_id": evid.evidence_id,
-                    "evidence_type": evid.evidence_type.value,
-                    "result_summary": evid.result_summary,
-                    "datasets": evid.datasets,
-                    "metrics": evid.metrics,
                     "paper_id": paper_id,
+                    "items": [
+                        {
+                            "evidence_id": evid.evidence_id,
+                            "evidence_type": evid.evidence_type.value,
+                            "result_summary": evid.result_summary,
+                            "datasets": evid.datasets,
+                            "metrics": evid.metrics,
+                            "numeric_results": _json.dumps(
+                                evid.numeric_results, ensure_ascii=False
+                            ) if evid.numeric_results else "{}",
+                        }
+                        for evid in arg.evidences
+                    ],
                 })
 
-            # Claim-Evidence links
-            for link in arg.claim_evidence_links:
+            # ---- Claim-Evidence links (batch) ----
+            if arg.claim_evidence_links:
                 await session.run("""
-                    MATCH (cl:Claim {claim_id: $claim_id})
-                    MATCH (e:Evidence {evidence_id: $evidence_id})
+                    UNWIND $items AS item
+                    MATCH (cl:Claim {claim_id: item.claim_id})
+                    MATCH (e:Evidence {evidence_id: item.evidence_id})
                     MERGE (cl)-[r:SUPPORTED_BY]->(e)
-                    SET r.strength = $strength,
-                        r.explanation = $explanation
+                    SET r.strength = item.strength,
+                        r.explanation = item.explanation
                 """, {
-                    "claim_id": link.claim_id,
-                    "evidence_id": link.evidence_id,
-                    "strength": link.strength.value,
-                    "explanation": link.explanation,
+                    "items": [
+                        {
+                            "claim_id": link.claim_id,
+                            "evidence_id": link.evidence_id,
+                            "strength": link.strength.value,
+                            "explanation": link.explanation,
+                        }
+                        for link in arg.claim_evidence_links
+                    ],
                 })
 
-            # Baselines
-            for bl in arg.baselines:
+            # ---- Baselines (batch) ----
+            if arg.baselines:
                 await session.run("""
-                    MERGE (b:Baseline {baseline_id: $baseline_id})
-                    SET b.method_name = $method_name,
-                        b.paper_ref = $paper_ref,
+                    UNWIND $items AS item
+                    MERGE (b:Baseline {baseline_id: item.baseline_id})
+                    SET b.method_name = item.method_name,
+                        b.paper_ref = item.paper_ref,
                         b.source_paper_id = $paper_id
                 """, {
-                    "baseline_id": bl.baseline_id,
-                    "method_name": bl.method_name,
-                    "paper_ref": bl.paper_ref,
                     "paper_id": paper_id,
+                    "items": [
+                        {
+                            "baseline_id": bl.baseline_id,
+                            "method_name": bl.method_name,
+                            "paper_ref": bl.paper_ref,
+                        }
+                        for bl in arg.baselines
+                    ],
                 })
 
-            # Limitations
-            for lim in arg.limitations:
+            # ---- Limitations (batch) ----
+            if arg.limitations:
                 await session.run("""
-                    MERGE (l:Limitation {limitation_id: $limitation_id})
-                    SET l.text = $text,
-                        l.scope = $scope,
-                        l.acknowledged_by_author = $acknowledged,
+                    UNWIND $items AS item
+                    MERGE (l:Limitation {limitation_id: item.limitation_id})
+                    SET l.text = item.text,
+                        l.scope = item.scope,
+                        l.acknowledged_by_author = item.acknowledged,
                         l.source_paper_id = $paper_id
                     WITH l
                     MATCH (p:Paper {paper_id: $paper_id})
                     MERGE (p)-[:HAS_LIMITATION]->(l)
                 """, {
-                    "limitation_id": lim.limitation_id,
-                    "text": lim.text,
-                    "scope": lim.scope,
-                    "acknowledged": lim.acknowledged_by_author,
                     "paper_id": paper_id,
+                    "items": [
+                        {
+                            "limitation_id": lim.limitation_id,
+                            "text": lim.text,
+                            "scope": lim.scope,
+                            "acknowledged": lim.acknowledged_by_author,
+                        }
+                        for lim in arg.limitations
+                    ],
                 })
 
     async def get_claim_evidence_ledger(self, paper_id: str) -> ClaimEvidenceLedger:

@@ -2,6 +2,13 @@
 
 import asyncio
 
+from acadgraph.kg.ontology import (
+    CLAIM_COLLECTION,
+    DOC_KIND_CLAIM,
+    DOC_KIND_EVIDENCE,
+    DOC_KIND_SECTION,
+    ENTITY_COLLECTION,
+)
 from acadgraph.kg.query_engine import KGQueryEngine
 
 
@@ -16,7 +23,7 @@ class _StubQdrant:
 
     async def search_similar(self, collection, _query_vector, k=10, filters=None):
         self.calls.append((collection, k, filters))
-        if collection == "entities":
+        if collection == ENTITY_COLLECTION:
             # first/second entities call both return entity-like payloads
             return [
                 {
@@ -35,9 +42,13 @@ class _StubQdrant:
                     "payload": {"paper_id": "p3", "entity_type": "DATASET", "name": "DataC", "section": "experiments"},
                 },
             ]
-        if collection == "claims":
+        if collection == CLAIM_COLLECTION:
+            if filters and filters.get("doc_kind") == DOC_KIND_EVIDENCE:
+                return [
+                    {"id": "ev-1", "score": 0.66, "payload": {"paper_id": "p1", "doc_kind": DOC_KIND_EVIDENCE, "evidence_type": "EXPERIMENT"}},
+                ]
             return [
-                {"id": "cl-1", "score": 0.70, "payload": {"paper_id": "p1", "claim_type": "PERFORMANCE", "evidence_type": "EXPERIMENT"}},
+                {"id": "cl-1", "score": 0.70, "payload": {"paper_id": "p1", "doc_kind": DOC_KIND_CLAIM, "claim_type": "PERFORMANCE", "evidence_type": "EXPERIMENT"}},
             ]
         return []
 
@@ -114,3 +125,25 @@ def test_enhanced_recall_includes_evolution_path_candidates():
 
     p5 = next(item for item in results if item["paper_id"] == "p5")
     assert p5["path_scores"].get("evolution", 0) > 0
+
+
+def test_enhanced_recall_uses_doc_kind_filters():
+    """Shared collections should be queried with strict doc_kind filters."""
+    engine = _build_engine()
+
+    _ = asyncio.run(engine.enhanced_recall("new method", k=10))
+
+    calls = engine.qdrant.calls
+    assert (CLAIM_COLLECTION, 10, {"doc_kind": DOC_KIND_CLAIM}) in calls
+    assert (ENTITY_COLLECTION, 10, {"doc_kind": DOC_KIND_SECTION}) in calls
+
+
+def test_verify_claims_queries_evidence_with_doc_kind_filter():
+    """Claim verification must separate claim/evidence lookups in shared collection."""
+    engine = _build_engine()
+
+    _ = asyncio.run(engine.verify_claims_against_literature([{"text": "our method is robust"}], k=3))
+
+    calls = engine.qdrant.calls
+    assert (CLAIM_COLLECTION, 3, {"doc_kind": DOC_KIND_CLAIM}) in calls
+    assert (CLAIM_COLLECTION, 3, {"doc_kind": DOC_KIND_EVIDENCE}) in calls

@@ -16,6 +16,14 @@ from typing import Any
 
 from acadgraph.embedding_client import EmbeddingClient
 from acadgraph.kg.interfaces import KgRepository, VectorIndex
+from acadgraph.kg.ontology import (
+    CLAIM_COLLECTION,
+    ENTITY_COLLECTION,
+    DOC_KIND_CLAIM,
+    DOC_KIND_ENTITY,
+    DOC_KIND_EVIDENCE,
+    DOC_KIND_SECTION,
+)
 from acadgraph.kg.schema import (
     ClaimEvidenceLedger,
     CompetitionSpace,
@@ -63,17 +71,20 @@ class KGQueryEngine:
 
         # Search similar entities
         entity_hits = await self.qdrant.search_similar(
-            "entities", idea_embedding, k=k * 2
+            ENTITY_COLLECTION, idea_embedding, k=k * 2,
+            filters={"doc_kind": DOC_KIND_ENTITY},
         )
 
         # Search similar claims
         claim_hits = await self.qdrant.search_similar(
-            "claims", idea_embedding, k=k
+            CLAIM_COLLECTION, idea_embedding, k=k,
+            filters={"doc_kind": DOC_KIND_CLAIM},
         )
 
         # Search similar sections
         section_hits = await self.qdrant.search_similar(
-            "entities", idea_embedding, k=k
+            ENTITY_COLLECTION, idea_embedding, k=k,
+            filters={"doc_kind": DOC_KIND_SECTION},
         )
 
         # Collect unique paper IDs with scores
@@ -252,12 +263,12 @@ Return JSON:
 
             # Search for similar claims in other papers
             similar_claims = await self.qdrant.search_similar(
-                "claims", claim_embedding, k=k,
+                CLAIM_COLLECTION, claim_embedding, k=k, filters={"doc_kind": DOC_KIND_CLAIM}
             )
 
             # Search for related evidence
             similar_evidence = await self.qdrant.search_similar(
-                "claims", claim_embedding, k=k,
+                CLAIM_COLLECTION, claim_embedding, k=k, filters={"doc_kind": DOC_KIND_EVIDENCE}
             )
 
             results.append({
@@ -334,7 +345,7 @@ Return JSON:
                     all_results[pid]["path_matches"][path_key].append(path_payload)
 
         # Path 1: Entity-based recall
-        entity_hits = await self.qdrant.search_similar("entities", idea_embedding, k=k)
+        entity_hits = await self.qdrant.search_similar(ENTITY_COLLECTION, idea_embedding, k=k)
         for hit in entity_hits:
             payload = hit.get("payload", {})
             _upsert_result(
@@ -345,8 +356,8 @@ Return JSON:
                 path_payload=payload.get("name", ""),
             )
 
-        # Path 2: Claim-based recall
-        claim_hits = await self.qdrant.search_similar("claims", idea_embedding, k=k)
+        # Path 2: Claim-based recall (strict type filter in shared collection)
+        claim_hits = await self.qdrant.search_similar(CLAIM_COLLECTION, idea_embedding, k=k, filters={"doc_kind": DOC_KIND_CLAIM})
         for hit in claim_hits:
             payload = hit.get("payload", {})
             _upsert_result(
@@ -380,8 +391,8 @@ Return JSON:
                 path_payload=link_count,
             )
 
-        # Path 4: Section-based recall
-        section_hits = await self.qdrant.search_similar("entities", idea_embedding, k=k)
+        # Path 4: Section-based recall (strict type filter in shared collection)
+        section_hits = await self.qdrant.search_similar(ENTITY_COLLECTION, idea_embedding, k=k, filters={"doc_kind": DOC_KIND_SECTION})
         for hit in section_hits:
             payload = hit.get("payload", {})
             _upsert_result(
@@ -419,7 +430,7 @@ Return JSON:
         # Find the method entity by searching Qdrant
         method_embedding = await self.embedding.embed(f"METHOD: {method_name}")
         hits = await self.qdrant.search_similar(
-            "entities", method_embedding, k=5,
+            ENTITY_COLLECTION, method_embedding, k=5,
             filters={"entity_type": "METHOD"},
         )
 
@@ -445,7 +456,8 @@ Return JSON:
         # Search for entities in this domain
         domain_embedding = await self.embedding.embed(f"research domain: {domain}")
         entity_hits = await self.qdrant.search_similar(
-            "entities", domain_embedding, k=50
+            ENTITY_COLLECTION, domain_embedding, k=50,
+            filters={"doc_kind": DOC_KIND_ENTITY},
         )
 
         # Optional year-range filtering on related paper IDs.
@@ -509,7 +521,7 @@ Return JSON:
         """Get overall KG statistics."""
         neo4j_stats = await self.neo4j.get_stats()
         qdrant_stats = {}
-        for collection in ["entities", "claims"]:
+        for collection in [ENTITY_COLLECTION, CLAIM_COLLECTION]:
             try:
                 count = await self.qdrant.get_collection_count(collection)
                 qdrant_stats[collection] = count

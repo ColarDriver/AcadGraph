@@ -2,6 +2,12 @@
 
 import pytest
 
+from acadgraph.kg.ontology import (
+    ALLOWED_PAPER_ENTITY_RELATIONS,
+    normalize_evidence_span,
+    validate_confidence,
+    validate_paper_entity_relation,
+)
 from acadgraph.kg.schema import (
     ArgumentationGraph,
     Claim,
@@ -170,3 +176,26 @@ def test_claim_evidence_ledger_normalizes_string_enums_for_unsupported_p0():
     assert unsupported[0].claim_text == "Critical claim without full evidence"
     assert unsupported[0].severity == ClaimSeverity.P0
     assert unsupported[0].support_status == SupportStrength.PARTIAL
+
+def test_link_paper_entity_policy_rejects_invalid_relation_type():
+    """Paper->Entity relation should enforce allowed relation types."""
+    assert "PROPOSES" in ALLOWED_PAPER_ENTITY_RELATIONS
+    assert validate_paper_entity_relation("PROPOSES") is True
+    assert validate_paper_entity_relation("INVALID_REL") is False
+
+
+def test_cross_layer_link_policy_rejects_out_of_range_confidence():
+    """Cross-layer links should enforce confidence in [0,1]."""
+    assert validate_confidence(0.0) is True
+    assert validate_confidence(1.0) is True
+    assert validate_confidence(-0.1) is False
+    assert validate_confidence(1.5) is False
+
+
+
+def test_normalize_evidence_span_returns_unknown_for_empty_input():
+    """Evidence span normalizer should return stable fallback for empty values."""
+    assert normalize_evidence_span(None) == "unknown"
+    assert normalize_evidence_span("") == "unknown"
+    assert normalize_evidence_span("   ") == "unknown"
+    assert normalize_evidence_span(" table 2 ") == "table 2"
