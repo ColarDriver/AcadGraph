@@ -14,6 +14,8 @@ import logging
 from typing import Any
 
 from acadgraph.embedding_client import EmbeddingClient
+from acadgraph.kg.interfaces import VectorIndex
+from acadgraph.kg.ontology import DOC_KIND_ENTITY, ENTITY_COLLECTION
 from acadgraph.kg.prompts.loader import load_prompt, render_prompt
 from acadgraph.kg.schema import (
     Entity,
@@ -84,9 +86,10 @@ def get_extraction_prompt(section_name: str, text: str, max_chars: int = 8000) -
 class EntityExtractor:
     """Semantic entity extractor — section-aware, schema-constrained."""
 
-    def __init__(self, llm: LLMClient, embedding: EmbeddingClient):
+    def __init__(self, llm: LLMClient, embedding: EmbeddingClient, qdrant: VectorIndex | None = None):
         self._llm = llm
         self._embedding = embedding
+        self._qdrant = qdrant
         # In-memory entity name → entity mapping for cross-paper dedup
         self._entity_cache: dict[str, Entity] = {}
 
@@ -208,10 +211,11 @@ class EntityExtractor:
         self, new_entities: list[Entity], threshold: float = 0.95
     ) -> list[Entity]:
         """
-        Cross-paper entity deduplication via embedding similarity + name matching.
+        Cross-paper entity deduplication via Qdrant ANN search + name matching.
 
-        If a new entity has embedding similarity > threshold with a cached entity,
-        they are merged (the existing entity ID is reused).
+        Uses the existing Qdrant ENTITY_COLLECTION for efficient nearest-
+        neighbour lookup instead of brute-force O(N×M) embedding comparisons.
+        Falls back to exact-name matching if Qdrant is unavailable.
         """
         if not self._entity_cache:
             # First paper — no dedup needed, just cache
@@ -233,33 +237,42 @@ class EntityExtractor:
                 result.append(entity)
                 continue
 
-            # Embedding-based similarity check
-            try:
-                entity_emb = await self._embedding.embed(
-                    f"{entity.entity_type.value}: {entity.name}. {entity.description}"
-                )
-                best_sim = 0.0
-                best_match: Entity | None = None
-
-                for cached in self._entity_cache.values():
-                    if cached.entity_type != entity.entity_type:
-                        continue
-                    cached_emb = await self._embedding.embed(
-                        f"{cached.entity_type.value}: {cached.name}. {cached.description}"
+            # ANN-based similarity check via Qdrant
+            if self._qdrant:
+                try:
+                    entity_text = f"{entity.entity_type.value}: {entity.name}. {entity.description}"
+                    entity_emb = await self._embedding.embed(entity_text)
+                    hits = await self._qdrant.search_similar(
+                        ENTITY_COLLECTION,
+                        entity_emb,
+                        k=3,
+                        filters={"doc_kind": DOC_KIND_ENTITY, "entity_type": entity.entity_type.value},
                     )
-                    sim = self._cosine_sim(entity_emb, cached_emb)
-                    if sim > best_sim:
-                        best_sim = sim
-                        best_match = cached
 
-                if best_sim >= threshold and best_match:
-                    entity.entity_id = best_match.entity_id
-                    logger.debug("Dedup merged '%s' → '%s' (sim=%.3f)", entity.name, best_match.name, best_sim)
-                else:
+                    best_match: Entity | None = None
+                    for hit in hits:
+                        if hit.get("score", 0) >= threshold:
+                            hit_name = hit.get("payload", {}).get("name", "").lower()
+                            if hit_name in self._entity_cache:
+                                candidate = self._entity_cache[hit_name]
+                                if candidate.entity_type == entity.entity_type:
+                                    best_match = candidate
+                                    break
+
+                    if best_match:
+                        entity.entity_id = best_match.entity_id
+                        logger.debug(
+                            "Dedup merged '%s' → '%s' (ANN)",
+                            entity.name, best_match.name,
+                        )
+                    else:
+                        self._entity_cache[normalized] = entity
+
+                except Exception as e:
+                    logger.warning("ANN dedup failed for '%s': %s", entity.name, e)
                     self._entity_cache[normalized] = entity
-
-            except Exception as e:
-                logger.warning("Embedding dedup failed for '%s': %s", entity.name, e)
+            else:
+                # No Qdrant available — fallback to cache-only exact match
                 self._entity_cache[normalized] = entity
 
             result.append(entity)

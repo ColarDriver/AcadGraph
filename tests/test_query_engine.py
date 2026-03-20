@@ -5,6 +5,7 @@ import asyncio
 from acadgraph.kg.ontology import (
     CLAIM_COLLECTION,
     DOC_KIND_CLAIM,
+    DOC_KIND_ENTITY,
     DOC_KIND_EVIDENCE,
     DOC_KIND_SECTION,
     ENTITY_COLLECTION,

@@ -30,6 +30,12 @@ class LLMClient:
         )
         self._semaphore = asyncio.Semaphore(self.config.max_concurrent)
 
+    async def __aenter__(self) -> "LLMClient":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=30))
     async def complete(
         self,

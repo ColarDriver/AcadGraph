@@ -125,6 +125,40 @@ class KgRepository(Protocol):
     ) -> bool:
         """Create/merge a DATASET->EVIDENCE cross-layer edge."""
 
+    async def add_method_evolution(
+        self,
+        from_method_id: str,
+        to_method_id: str,
+        source_paper_id: str,
+        delta_description: str = "",
+        year: int | None = None,
+        confidence: float = 1.0,
+    ) -> bool:
+        """Create EVOLVES_FROM edge between method entities."""
+
+    async def get_related_methods(
+        self,
+        paper_id: str,
+        limit: int = 40,
+    ) -> list[dict[str, Any]]:
+        """Return this paper's methods and earlier comparable methods."""
+
+    async def link_citation_gap(
+        self,
+        citing_paper_id: str,
+        cited_paper_id: str,
+        gap_id: str,
+        confidence: float = 0.8,
+        source_rule: str | None = None,
+    ) -> bool:
+        """Create SUPPORTS_GAP edge from a citation to a Gap node."""
+
+    async def get_gap_context(self, problem_id: str) -> dict[str, Any]:
+        """Get full gap context for a Problem."""
+
+    async def traverse_evidence_chain(self, claim_id: str) -> dict[str, Any]:
+        """Traverse the full evidence chain for a Claim."""
+
 
 @runtime_checkable
 class VectorIndex(Protocol):

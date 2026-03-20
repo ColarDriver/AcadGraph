@@ -57,6 +57,22 @@ async def _get_components():
     return neo4j, qdrant, llm, embedding, config
 
 
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def managed_components():
+    """Yield all components and ensure clean shutdown."""
+    neo4j, qdrant, llm, embedding, config = await _get_components()
+    try:
+        yield neo4j, qdrant, llm, embedding, config
+    finally:
+        await neo4j.close()
+        await qdrant.close()
+        await llm.close()
+        await embedding.close()
+
+
 @click.group()
 @click.option("--log-level", default="INFO", help="Logging level")
 def main(log_level: str) -> None:
@@ -69,18 +85,12 @@ def init() -> None:
     """Initialize Neo4j schema and Qdrant collections."""
 
     async def _init():
-        neo4j, qdrant, llm, embedding, _ = await _get_components()
-        try:
+        async with managed_components() as (neo4j, qdrant, llm, embedding, _):
             console.print("[bold green]Initializing Neo4j schema...[/]")
             await neo4j.init_schema()
             console.print("[bold green]Initializing Qdrant collections...[/]")
             await qdrant.init_collections()
             console.print("[bold green]✓ Initialization complete![/]")
-        finally:
-            await neo4j.close()
-            await qdrant.close()
-            await llm.close()
-            await embedding.close()
 
     asyncio.run(_init())
 
@@ -98,8 +108,7 @@ def add(source: str, paper_id: str | None, title: str, year: int | None, venue: 
         from acadgraph.kg.incremental_builder import IncrementalKGBuilder
         from acadgraph.kg.schema import PaperSource
 
-        neo4j, qdrant, llm, embedding, _ = await _get_components()
-        try:
+        async with managed_components() as (neo4j, qdrant, llm, embedding, _):
             builder = IncrementalKGBuilder(neo4j, qdrant, llm, embedding)
 
             path = Path(source)
@@ -126,11 +135,6 @@ def add(source: str, paper_id: str | None, title: str, year: int | None, venue: 
                     f"  Entities: {result.entities_added}, Citations: {result.citations_added}, "
                     f"Claims: {result.claims_added}, Evidence: {result.evidences_added}"
                 )
-        finally:
-            await neo4j.close()
-            await qdrant.close()
-            await llm.close()
-            await embedding.close()
 
     asyncio.run(_add())
 
@@ -146,8 +150,7 @@ def batch(directory: str, batch_size: int, ext: str) -> None:
         from acadgraph.kg.incremental_builder import IncrementalKGBuilder
         from acadgraph.kg.schema import PaperSource
 
-        neo4j, qdrant, llm, embedding, _ = await _get_components()
-        try:
+        async with managed_components() as (neo4j, qdrant, llm, embedding, _):
             builder = IncrementalKGBuilder(neo4j, qdrant, llm, embedding)
 
             dir_path = Path(directory)
@@ -170,11 +173,6 @@ def batch(directory: str, batch_size: int, ext: str) -> None:
                 f"{result.successful}/{result.total_papers} successful "
                 f"in {result.total_duration_seconds:.1f}s[/]"
             )
-        finally:
-            await neo4j.close()
-            await qdrant.close()
-            await llm.close()
-            await embedding.close()
 
     asyncio.run(_batch())
 
@@ -189,8 +187,7 @@ def query(idea: str, mode: str, k: int) -> None:
     async def _query():
         from acadgraph.kg.query_engine import KGQueryEngine
 
-        neo4j, qdrant, llm, embedding, _ = await _get_components()
-        try:
+        async with managed_components() as (neo4j, qdrant, llm, embedding, _):
             engine = KGQueryEngine(neo4j, qdrant, llm, embedding)
 
             if mode == "competition":
@@ -226,12 +223,6 @@ def query(idea: str, mode: str, k: int) -> None:
                     )
                 console.print(table)
 
-        finally:
-            await neo4j.close()
-            await qdrant.close()
-            await llm.close()
-            await embedding.close()
-
     asyncio.run(_query())
 
 
@@ -243,8 +234,7 @@ def audit(paper_id: str) -> None:
     async def _audit():
         from acadgraph.kg.query_engine import KGQueryEngine
 
-        neo4j, qdrant, llm, embedding, _ = await _get_components()
-        try:
+        async with managed_components() as (neo4j, qdrant, llm, embedding, _):
             engine = KGQueryEngine(neo4j, qdrant, llm, embedding)
             ledger = await engine.get_claim_evidence_ledger(paper_id)
 
@@ -281,12 +271,6 @@ def audit(paper_id: str) -> None:
             else:
                 console.print("\n[bold green]✓ All P0 claims are fully supported.[/]")
 
-        finally:
-            await neo4j.close()
-            await qdrant.close()
-            await llm.close()
-            await embedding.close()
-
     asyncio.run(_audit())
 
 
@@ -297,8 +281,7 @@ def stats() -> None:
     async def _stats():
         from acadgraph.kg.query_engine import KGQueryEngine
 
-        neo4j, qdrant, llm, embedding, _ = await _get_components()
-        try:
+        async with managed_components() as (neo4j, qdrant, llm, embedding, _):
             engine = KGQueryEngine(neo4j, qdrant, llm, embedding)
             stats_data = await engine.get_stats()
 
@@ -318,12 +301,6 @@ def stats() -> None:
             for name, count in stats_data.get("qdrant", {}).items():
                 table2.add_row(name, str(count))
             console.print(table2)
-
-        finally:
-            await neo4j.close()
-            await qdrant.close()
-            await llm.close()
-            await embedding.close()
 
     asyncio.run(_stats())
 

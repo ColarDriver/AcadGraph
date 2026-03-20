@@ -8,6 +8,7 @@ Manages only two collections for this project profile:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any, Sequence
 
@@ -41,6 +42,13 @@ class QdrantKGStore(VectorIndex):
         self.config = config or QdrantConfig()
         self.embedding_dim = embedding_dim
         self._client: AsyncQdrantClient | None = None
+
+    async def __aenter__(self) -> "QdrantKGStore":
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
 
     async def connect(self) -> None:
         """Connect to Qdrant."""
@@ -171,5 +179,11 @@ class QdrantKGStore(VectorIndex):
 
     @staticmethod
     def _to_int_id(string_id: str) -> int:
-        """Convert a string ID to an integer for Qdrant (using hash)."""
-        return abs(hash(string_id)) % (2**63)
+        """Convert a string ID to a deterministic integer for Qdrant.
+
+        Uses SHA-256 instead of Python's built-in ``hash()`` to ensure
+        stable, cross-process-reproducible IDs (``hash()`` is randomised
+        by ``PYTHONHASHSEED`` and varies between interpreter runs).
+        """
+        digest = hashlib.sha256(string_id.encode()).hexdigest()
+        return int(digest[:15], 16)  # 60-bit range, fits Qdrant's int64

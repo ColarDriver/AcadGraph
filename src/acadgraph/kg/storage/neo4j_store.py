@@ -57,6 +57,13 @@ class Neo4jKGStore(KgRepository):
         self.config = config or Neo4jConfig()
         self._driver: AsyncDriver | None = None
 
+    async def __aenter__(self) -> "Neo4jKGStore":
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
+
     async def connect(self) -> None:
         """Connect to Neo4j."""
         self._driver = AsyncGraphDatabase.driver(
@@ -104,6 +111,16 @@ class Neo4jKGStore(KgRepository):
             # Indexes
             "CREATE INDEX IF NOT EXISTS FOR (p:Paper) ON (p.year)",
             "CREATE INDEX IF NOT EXISTS FOR (c:Claim) ON (c.severity, c.claim_type)",
+            # Fulltext indexes for semantic search
+            (
+                "CREATE FULLTEXT INDEX entity_names IF NOT EXISTS "
+                "FOR (n:Method|Dataset|Task|Metric|Model|Framework|Concept) "
+                "ON EACH [n.name, n.description]"
+            ),
+            (
+                "CREATE FULLTEXT INDEX claim_text IF NOT EXISTS "
+                "FOR (n:Claim) ON EACH [n.text]"
+            ),
         ]
 
         async with self.driver.session() as session:
@@ -180,9 +197,14 @@ class Neo4jKGStore(KgRepository):
             "confidence": relation.confidence,
         }
         for k, v in relation.properties.items():
-            if isinstance(v, (str, int, float, bool)):
-                params[k] = v
-                query += f"\nSET r.{k} = ${k}"
+            if not isinstance(v, (str, int, float, bool)):
+                continue
+            if not _SAFE_PROPERTY_KEY.match(k):
+                logger.warning("Skipping unsafe relation property key: %r", k)
+                continue
+            param_key = f"prop_{k}"
+            params[param_key] = v
+            query += f"\nSET r.{k} = ${param_key}"
 
         async with self.driver.session() as session:
             await session.run(query, params)
@@ -226,12 +248,17 @@ class Neo4jKGStore(KgRepository):
 
         if properties:
             for key, value in properties.items():
-                if isinstance(value, (str, int, float, bool)):
-                    params[key] = value
-                    query = query.replace(
-                        "RETURN count(r) AS linked",
-                        f"SET r.{key} = ${key}\n        RETURN count(r) AS linked",
-                    )
+                if not isinstance(value, (str, int, float, bool)):
+                    continue
+                if not _SAFE_PROPERTY_KEY.match(key):
+                    logger.warning("Skipping unsafe link_paper_entity property key: %r", key)
+                    continue
+                param_key = f"prop_{key}"
+                params[param_key] = value
+                query = query.replace(
+                    "RETURN count(r) AS linked",
+                    f"SET r.{key} = ${param_key}\n        RETURN count(r) AS linked",
+                )
 
         async with self.driver.session() as session:
             result = await session.run(query, params)
@@ -886,3 +913,94 @@ class Neo4jKGStore(KgRepository):
                 record = await result.single()
                 stats[label] = record["cnt"] if record else 0
         return stats
+
+    # ========================================================================
+    # Cross-Layer Linking (CITATION → GAP)
+    # ========================================================================
+
+    async def link_citation_gap(
+        self,
+        citing_paper_id: str,
+        cited_paper_id: str,
+        gap_id: str,
+        confidence: float = 0.8,
+        source_rule: str | None = None,
+    ) -> bool:
+        """Create a SUPPORTS_GAP edge from a citation to a Gap node."""
+        query = """
+        MATCH (citing:Paper {paper_id: $citing_paper_id})-[c:CITES]->(cited:Paper {paper_id: $cited_paper_id})
+        MATCH (g:Gap {gap_id: $gap_id})
+        MERGE (c)-[r:SUPPORTS_GAP]->(g)
+        SET r.confidence = $confidence,
+            r.source_rule = $source_rule
+        RETURN count(r) AS linked
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, {
+                "citing_paper_id": citing_paper_id,
+                "cited_paper_id": cited_paper_id,
+                "gap_id": gap_id,
+                "confidence": confidence,
+                "source_rule": source_rule or "heuristic.citation_gap_embedding",
+            })
+            record = await result.single()
+            return bool(record and record.get("linked", 0) > 0)
+
+    # ========================================================================
+    # Additional Query Methods (from design doc)
+    # ========================================================================
+
+    async def get_gap_context(self, problem_id: str) -> dict[str, Any]:
+        """Get the full gap context for a Problem node."""
+        query = """
+        MATCH (pr:Problem {problem_id: $problem_id})
+        OPTIONAL MATCH (pr)-[:HAS_GAP]->(g:Gap)
+        OPTIONAL MATCH (g)-[:ADDRESSED_BY]->(ci:CoreIdea)
+        RETURN pr.description AS problem,
+               pr.scope AS scope,
+               pr.importance_signal AS importance_signal,
+               collect(DISTINCT {
+                   gap_id: g.gap_id,
+                   failure_mode: g.failure_mode,
+                   constraint: g.constraint,
+                   prior_methods: g.prior_methods_failing,
+                   core_idea: ci.mechanism,
+                   novelty_type: ci.novelty_type,
+                   key_innovation: ci.key_innovation
+               }) AS gaps
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, {"problem_id": problem_id})
+            record = await result.single()
+            if not record:
+                return {}
+            return dict(record)
+
+    async def traverse_evidence_chain(self, claim_id: str) -> dict[str, Any]:
+        """Traverse the full evidence chain for a Claim."""
+        query = """
+        MATCH (cl:Claim {claim_id: $claim_id})
+        OPTIONAL MATCH (cl)-[s:SUPPORTED_BY]->(e:Evidence)
+        OPTIONAL MATCH (ci:CoreIdea)-[:MAKES_CLAIM]->(cl)
+        OPTIONAL MATCH (g:Gap)-[:ADDRESSED_BY]->(ci)
+        OPTIONAL MATCH (pr:Problem)-[:HAS_GAP]->(g)
+        RETURN cl.text AS claim_text,
+               cl.claim_type AS claim_type,
+               cl.severity AS severity,
+               collect(DISTINCT {
+                   evidence_id: e.evidence_id,
+                   evidence_type: e.evidence_type,
+                   result_summary: e.result_summary,
+                   strength: s.strength
+               }) AS evidences,
+               ci.mechanism AS core_mechanism,
+               ci.key_innovation AS key_innovation,
+               g.failure_mode AS gap_failure,
+               pr.description AS problem_description
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, {"claim_id": claim_id})
+            record = await result.single()
+            if not record:
+                return {}
+            return dict(record)

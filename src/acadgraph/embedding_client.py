@@ -30,6 +30,12 @@ class EmbeddingClient:
         self._cache: dict[str, list[float]] = {}
         self._semaphore = asyncio.Semaphore(3)  # Embedding calls are heavier
 
+    async def __aenter__(self) -> "EmbeddingClient":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
+
     async def embed(self, text: str) -> list[float]:
         """Embed a single text string. Results are cached in-memory."""
         key = self._cache_key(text)
@@ -61,7 +67,7 @@ class EmbeddingClient:
 
     @staticmethod
     def _cache_key(text: str) -> str:
-        return hashlib.md5(text.encode()).hexdigest()
+        return hashlib.sha256(text.encode()).hexdigest()[:24]
 
     @property
     def dim(self) -> int:

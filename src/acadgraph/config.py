@@ -24,7 +24,7 @@ def _load_env() -> None:
     load_dotenv()  # fallback to default behaviour
 
 
-_load_env()
+_env_loaded = False
 
 
 @dataclass(frozen=True)
@@ -70,5 +70,12 @@ class AppConfig:
 
 
 def get_config() -> AppConfig:
-    """Return a fresh configuration snapshot."""
+    """Return a fresh configuration snapshot.
+
+    The first call triggers ``.env`` loading to avoid import-time side effects.
+    """
+    global _env_loaded
+    if not _env_loaded:
+        _load_env()
+        _env_loaded = True
     return AppConfig()

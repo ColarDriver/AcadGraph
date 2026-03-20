@@ -55,7 +55,7 @@
 
 ## 三、实现步骤（共 8 个模块）
 
-### 模块 1: 全文解析管道 (`src/idea2paper/kg/paper_parser.py`)
+### 模块 1: 全文解析管道 (`src/acadgraph/kg/paper_parser.py`)
 
 **功能**：PDF → 结构化 Sections → Markdown
 
@@ -99,7 +99,7 @@ class ParsedPaper:
 
 ---
 
-### 模块 2: Layer 1 — 语义实体抽取 (`src/idea2paper/kg/layer1_entities.py`)
+### 模块 2: Layer 1 — 语义实体抽取 (`src/acadgraph/kg/extract/entities.py`)
 
 **功能**：从论文各 section 抽取 7 类学术实体
 
@@ -152,7 +152,7 @@ CREATE CONSTRAINT FOR (d:Dataset) REQUIRE d.entity_id IS UNIQUE;
 
 ---
 
-### 模块 3: Layer 2 — 引用关系与技术演化 (`src/idea2paper/kg/layer2_evolution.py`)
+### 模块 3: Layer 2 — 引用关系与技术演化 (`src/acadgraph/kg/extract/evolution.py`)
 
 **功能**：建立带意图的引用边 + 时间演化链
 
@@ -202,7 +202,7 @@ CREATE INDEX paper_year FOR (p:Paper) ON (p.year)
 
 ---
 
-### 模块 4: Layer 3 — 论证链构建 (`src/idea2paper/kg/layer3_argumentation.py`)
+### 模块 4: Layer 3 — 论证链构建 (`src/acadgraph/kg/extract/argumentation.py`)
 
 **这是核心创新层** — 建模论文的完整论证链
 
@@ -294,7 +294,7 @@ class Layer3ArgumentationExtractor:
 
 ---
 
-### 模块 5: 存储层 — Neo4j + Qdrant 双驱 (`src/idea2paper/kg/storage/`)
+### 模块 5: 存储层 — Neo4j + Qdrant 双驱 (`src/acadgraph/kg/storage/`)
 
 #### 5.1 Neo4j 存储 (`neo4j_store.py`)
 
@@ -340,29 +340,22 @@ CREATE INDEX claim_severity FOR (c:Claim) ON (c.severity, c.type);
 
 ```python
 class QdrantKGStore:
-    """Qdrant 向量存储 — 语义检索层"""
+    """Qdrant 向量存储 — 语义检索层
+
+    实际部署中合并为 2 个 collection，通过 doc_kind payload 字段区分类型:
+    - entities: entity / section 类型 (通过 doc_kind 字段分离)
+    - claims: claim / evidence / citation 类型 (通过 doc_kind 字段分离)
+    """
 
     COLLECTIONS = {
-        "layer1_entities": {  # METHOD, DATASET, METRIC, TASK 等实体的 embedding
+        "entities": {  # METHOD, DATASET, METRIC, TASK 等实体 + 论文 section embedding
             "vector_size": 4096,  # Qwen3-Embedding-8B
             "distance": "Cosine"
         },
-        "layer2_citations": {  # 引用上下文的 embedding
+        "claims": {  # Claim / Evidence / Citation context embedding
             "vector_size": 4096,
             "distance": "Cosine"
         },
-        "layer3_claims": {  # Claim 文本的 embedding
-            "vector_size": 4096,
-            "distance": "Cosine"
-        },
-        "layer3_evidence": {  # Evidence 描述的 embedding
-            "vector_size": 4096,
-            "distance": "Cosine"
-        },
-        "paper_sections": {  # 论文各 section 的 embedding
-            "vector_size": 4096,
-            "distance": "Cosine"
-        }
     }
 
     def upsert_embedding(self, collection: str, id: str, vector: List[float],
@@ -373,7 +366,7 @@ class QdrantKGStore:
 
 ---
 
-### 模块 6: 增量构建管道 (`src/idea2paper/kg/incremental_builder.py`)
+### 模块 6: 增量构建管道 (`src/acadgraph/kg/incremental_builder.py`)
 
 **核心设计**：新论文到达时，只处理新论文，不重建已有图谱
 
@@ -435,7 +428,7 @@ class IncrementalKGBuilder:
 
 ---
 
-### 模块 7: 推理查询引擎 (`src/idea2paper/kg/query_engine.py`)
+### 模块 7: 推理查询引擎 (`src/acadgraph/kg/query_engine.py`)
 
 **功能**：供 idea2paper pipeline 调用的统一查询接口
 
@@ -542,25 +535,34 @@ unsupported = [c for c in ledger if c.support_status != "full"]
 ## 四、文件结构
 
 ```
-src/idea2paper/kg/
+src/acadgraph/
 ├── __init__.py
-├── paper_parser.py           # 模块1: 全文解析
-├── layer1_entities.py        # 模块2: 语义实体抽取
-├── layer2_evolution.py       # 模块3: 引用关系与演化链
-├── layer3_argumentation.py   # 模块4: 论证链构建
-├── storage/
-│   ├── __init__.py
-│   ├── neo4j_store.py        # 模块5a: Neo4j 存储
-│   └── qdrant_store.py       # 模块5b: Qdrant 存储
-├── incremental_builder.py    # 模块6: 增量构建管道
-├── query_engine.py           # 模块7: 推理查询引擎
-├── schema.py                 # 所有节点/边的 dataclass 定义
-└── prompts/
-    ├── layer1_extraction.py  # Layer1 抽取 prompt
-    ├── layer2_citation.py    # Layer2 引用意图分类 prompt
-    ├── layer3_zoning.py      # Layer3 Pass1 修辞角色 prompt
-    ├── layer3_schema.py      # Layer3 Pass2 结构化抽取 prompt
-    └── layer3_evidence.py    # Layer3 Pass3 证据链接 prompt
+├── config.py                 # 环境配置管理
+├── llm_client.py             # LLM 客户端
+├── embedding_client.py       # Embedding 客户端
+├── cli.py                    # CLI 入口
+└── kg/
+    ├── __init__.py
+    ├── schema.py                 # 所有节点/边的 dataclass 定义
+    ├── ontology.py               # KG 本体常量与验证
+    ├── interfaces.py             # 抽象接口 (KgRepository / VectorIndex)
+    ├── paper_parser.py           # 模块1: 全文解析
+    ├── incremental_builder.py    # 模块6: 增量构建管道
+    ├── query_engine.py           # 模块7: 推理查询引擎
+    ├── extract/
+    │   ├── __init__.py
+    │   ├── entities.py           # 模块2: 语义实体抽取 (EntityExtractor)
+    │   ├── evolution.py          # 模块3: 引用关系与演化链 (CitationEvolutionBuilder)
+    │   └── argumentation.py      # 模块4: 论证链构建 (ArgumentationExtractor)
+    ├── storage/
+    │   ├── __init__.py
+    │   ├── neo4j_store.py        # 模块5a: Neo4j 存储 (Neo4jKGStore)
+    │   └── qdrant_store.py       # 模块5b: Qdrant 存储 (QdrantKGStore)
+    └── prompts/
+        ├── loader.py             # Markdown prompt 加载器
+        ├── entity/               # Layer1 实体抽取 prompt
+        ├── citation/             # Layer2 引用分类 prompt
+        └── argumentation/        # Layer3 论证链抽取 prompt
 ```
 
 ---

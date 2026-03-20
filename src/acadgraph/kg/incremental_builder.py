@@ -45,6 +45,13 @@ from acadgraph.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
+# ---- Tuning Constants ----
+SECTION_EMBED_MAX_CHARS = 2000
+SECTION_MIN_LENGTH = 50
+CITATION_CONTEXT_MIN_LENGTH = 10
+METHOD_CLAIM_KEYWORD_MIN_LENGTH = 3
+CROSS_LAYER_GAP_THRESHOLD = 0.80
+
 
 class IncrementalKGBuilder:
     """Incremental knowledge graph builder."""
@@ -77,7 +84,7 @@ class IncrementalKGBuilder:
 
         # Sub-components
         self.parser = PaperParser(llm_client=llm)
-        self.entity_extractor = EntityExtractor(llm=llm, embedding=embedding)
+        self.entity_extractor = EntityExtractor(llm=llm, embedding=embedding, qdrant=qdrant_store)
         self.citation_builder = CitationEvolutionBuilder(llm=llm)
         self.argumentation_extractor = ArgumentationExtractor(llm=llm)
 
@@ -229,6 +236,20 @@ class IncrementalKGBuilder:
             # Store citation context embeddings in Qdrant
             await self._store_citation_embeddings(citations)
 
+            # Enrich citations from Semantic Scholar (best effort)
+            try:
+                enriched = await self.citation_builder.enrich_from_semantic_scholar(
+                    parsed.paper_id
+                )
+                for ec in enriched:
+                    try:
+                        await self.neo4j.add_citation(ec)
+                        result.citations_added += 1
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.debug("Semantic Scholar enrichment skipped for %s: %s", parsed.paper_id, e)
+
             # ---- Step 4: Argumentation Chain ----
             logger.info("[4/5] Extracting argumentation for %s", parsed.paper_id)
             arg_graph = await self.argumentation_extractor.extract(parsed)
@@ -355,7 +376,7 @@ class IncrementalKGBuilder:
         """Store citation context embeddings in Qdrant."""
         if not citations:
             return
-        valid = [c for c in citations if c.context and len(c.context) > 10]
+        valid = [c for c in citations if c.context and len(c.context) > CITATION_CONTEXT_MIN_LENGTH]
         if not valid:
             return
         texts = [c.context for c in valid]
@@ -429,12 +450,12 @@ class IncrementalKGBuilder:
         sections = [
             (name, text)
             for name, text in parsed_paper.sections.items()
-            if text and len(text.strip()) > 50
+            if text and len(text.strip()) > SECTION_MIN_LENGTH
         ]
         if not sections:
             return
 
-        texts = [text[:2000] for _, text in sections]  # Truncate long sections
+        texts = [text[:SECTION_EMBED_MAX_CHARS] for _, text in sections]  # Truncate long sections
         embeddings = await self.embedding.embed_batch(texts)
         ids = [f"sec_{parsed_paper.paper_id}_{name}" for name, _ in sections]
         payloads = [
@@ -541,7 +562,7 @@ class IncrementalKGBuilder:
             "with", "from", "using", "based", "via", "our", "we", "is", "are",
         }
         tokens = set(self._normalize_text(value).split())
-        return {token for token in tokens if len(token) > 2 and token not in stopwords}
+        return {token for token in tokens if len(token) > METHOD_CLAIM_KEYWORD_MIN_LENGTH and token not in stopwords}
 
     def _method_claim_confidence(self, method_name: str, claim_text: str) -> float:
         """Heuristic confidence for METHOD -> CLAIM links."""
@@ -696,3 +717,45 @@ class IncrementalKGBuilder:
             method_links,
             dataset_links,
         )
+
+        # --- CITATION → GAP linking via embedding similarity ---
+        await self._link_citations_to_gaps(paper_id, arg_graph)
+
+    async def _link_citations_to_gaps(self, paper_id: str, arg_graph) -> None:
+        """Link citation contexts to Gap nodes via embedding similarity.
+
+        Finds citations whose context semantically overlaps with gap
+        failure_mode/constraint descriptions and creates SUPPORTS_GAP edges.
+        """
+        if not arg_graph.gaps:
+            return
+
+        gap_texts = [
+            f"Gap: {g.failure_mode}. Constraint: {g.constraint}"
+            for g in arg_graph.gaps
+        ]
+        if not any(t.strip() for t in gap_texts):
+            return
+
+        try:
+            gap_embeddings = await self.embedding.embed_batch(gap_texts)
+
+            for gap, gap_emb in zip(arg_graph.gaps, gap_embeddings):
+                citation_hits = await self.qdrant.search_similar(
+                    CLAIM_COLLECTION,
+                    gap_emb,
+                    k=5,
+                    filters={"doc_kind": DOC_KIND_CITATION, "paper_id": paper_id},
+                )
+                for hit in citation_hits:
+                    if hit.get("score", 0) >= CROSS_LAYER_GAP_THRESHOLD:
+                        await self._call_neo4j_optional(
+                            "link_citation_gap",
+                            citing_paper_id=paper_id,
+                            cited_paper_id=hit.get("payload", {}).get("cited_paper_id", ""),
+                            gap_id=gap.gap_id,
+                            confidence=float(hit["score"]),
+                            source_rule="heuristic.citation_gap_embedding",
+                        )
+        except Exception as e:
+            logger.debug("CITATION→GAP linking failed for %s: %s", paper_id, e)
