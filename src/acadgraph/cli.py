@@ -178,6 +178,79 @@ def batch(directory: str, batch_size: int, ext: str) -> None:
 
 
 @main.command()
+@click.argument("jsonl_path", type=click.Path(exists=True))
+@click.option("--limit", default=None, type=int, help="Max papers to process")
+@click.option("--batch-size", default=3, help="Concurrent papers per batch")
+@click.option("--skip-existing/--no-skip-existing", default=True, help="Skip papers already in KG")
+def ingest(jsonl_path: str, limit: int | None, batch_size: int, skip_existing: bool) -> None:
+    """Ingest papers from a JSONL file (e.g. paper_reviews_dataset.jsonl).
+
+    Example:
+        acadgraph ingest data/paper_reviews_dataset.jsonl --limit 10
+    """
+
+    async def _ingest():
+        from acadgraph.kg.incremental_builder import IncrementalKGBuilder
+        from acadgraph.kg.jsonl_loader import iter_jsonl, jsonl_to_paper_source
+
+        async with managed_components() as (neo4j, qdrant, llm, embedding, _):
+            builder = IncrementalKGBuilder(neo4j, qdrant, llm, embedding)
+
+            # Get existing paper IDs if skip_existing
+            skip_ids: set[str] | None = None
+            if skip_existing:
+                try:
+                    skip_ids = await neo4j.get_existing_paper_ids()
+                    if skip_ids:
+                        console.print(
+                            f"[dim]Skipping {len(skip_ids)} existing papers[/]"
+                        )
+                except Exception:
+                    skip_ids = None
+
+            console.print(f"[bold]Ingesting from:[/] {jsonl_path}")
+            console.print(f"[dim]Batch size: {batch_size} (parallel)[/]")
+            if limit:
+                console.print(f"[dim]Limit: {limit} papers[/]")
+
+            # Collect all PaperSource objects
+            papers = []
+            for record in iter_jsonl(jsonl_path, limit=limit, skip_ids=skip_ids):
+                papers.append(jsonl_to_paper_source(record))
+
+            console.print(f"[bold]Loaded {len(papers)} papers, processing...[/]")
+
+            # Parallel batch processing
+            batch_result = await builder.add_papers_batch(
+                papers, batch_size=batch_size
+            )
+
+            # Show per-paper results
+            for r in batch_result.results:
+                if r.errors:
+                    console.print(
+                        f"[yellow]⚠ {r.errors[0][:80]}[/]"
+                    )
+                else:
+                    console.print(
+                        f"[green]✓[/] "
+                        f"({r.entities_added}E "
+                        f"{r.claims_added}C "
+                        f"{r.evidences_added}Ev "
+                        f"{r.duration_seconds:.1f}s)"
+                    )
+
+            console.print(
+                f"\n[bold green]Done:[/] "
+                f"{batch_result.successful}/{batch_result.total_papers} "
+                f"succeeded in {batch_result.total_duration_seconds:.1f}s, "
+                f"{batch_result.failed} errors"
+            )
+
+    asyncio.run(_ingest())
+
+
+@main.command()
 @click.argument("idea")
 @click.option("--mode", type=click.Choice(["competition", "gap", "recall"]), default="competition")
 @click.option("-k", default=10, help="Number of results")

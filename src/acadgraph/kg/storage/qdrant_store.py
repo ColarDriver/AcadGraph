@@ -138,6 +138,7 @@ class QdrantKGStore(VectorIndex):
         Search for similar vectors in a collection.
 
         Returns a list of dicts with 'id', 'score', and 'payload'.
+        Uses query_points (qdrant-client >= 1.7).
         """
         qdrant_filter = None
         if filters:
@@ -147,9 +148,9 @@ class QdrantKGStore(VectorIndex):
             ]
             qdrant_filter = Filter(must=conditions)
 
-        results = await self.client.search(
+        response = await self.client.query_points(
             collection_name=collection,
-            query_vector=query_vector,
+            query=query_vector,
             limit=k,
             query_filter=qdrant_filter,
         )
@@ -160,7 +161,7 @@ class QdrantKGStore(VectorIndex):
                 "score": hit.score,
                 "payload": hit.payload or {},
             }
-            for hit in results
+            for hit in response.points
         ]
 
     async def delete_by_paper_id(self, collection: str, paper_id: str) -> None:
