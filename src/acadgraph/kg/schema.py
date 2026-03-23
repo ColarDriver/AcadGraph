@@ -71,6 +71,15 @@ class Reference:
 
 
 @dataclass
+class SectionTreeNode:
+    """Hierarchical section node (inspired by PageIndex tree structure)."""
+    title: str = ""
+    heading_level: int | None = None
+    page_id: int | None = None
+    children: list["SectionTreeNode"] = field(default_factory=list)
+
+
+@dataclass
 class ParsedPaper:
     """Output of the full-text paper parser."""
     paper_id: str = ""
@@ -86,6 +95,9 @@ class ParsedPaper:
     references: list[Reference] = field(default_factory=list)
     raw_text: str = ""
     source_path: str = ""  # Original PDF / text path
+    section_tree: list[SectionTreeNode] = field(default_factory=list)
+    openreview_id: str = ""
+    abstract_raw: str = ""  # Original abstract (before section split)
 
 
 # ============================================================================
@@ -564,6 +576,9 @@ class PaperSource:
     year: int | None = None
     venue: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    content_meta: dict | None = None  # Structured ToC from JSONL
+    abstract: str = ""  # Pre-extracted abstract
+    related_notes_raw: str = ""  # Raw peer review data
 
     def __post_init__(self):
         if not self.paper_id:

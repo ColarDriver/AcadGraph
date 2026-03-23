@@ -35,6 +35,7 @@ from acadgraph.kg.ontology import (
 from acadgraph.kg.extract.entities import EntityExtractor
 from acadgraph.kg.extract.evolution import CitationEvolutionBuilder
 from acadgraph.kg.extract.argumentation import ArgumentationExtractor
+from acadgraph.kg.extract.peer_review import PeerReviewExtractor
 from acadgraph.kg.paper_parser import PaperParser
 from acadgraph.kg.schema import (
     BatchBuildResult,
@@ -87,6 +88,7 @@ class IncrementalKGBuilder:
         self.entity_extractor = EntityExtractor(llm=llm, embedding=embedding, qdrant=qdrant_store)
         self.citation_builder = CitationEvolutionBuilder(llm=llm)
         self.argumentation_extractor = ArgumentationExtractor(llm=llm)
+        self.peer_review_extractor = PeerReviewExtractor()
 
     async def _call_neo4j_optional(self, method_name: str, *args, **kwargs):
         """Call optional Neo4j methods without breaking alternate implementations."""
@@ -132,11 +134,18 @@ class IncrementalKGBuilder:
 
         try:
             # ---- Step 1: Parse ----
-            logger.info("[1/5] Parsing paper %s", paper_source.paper_id)
+            logger.info("[1/6] Parsing paper %s", paper_source.paper_id)
             if paper_source.pdf_path:
                 parsed = await self.parser.parse(paper_source.pdf_path)
             elif paper_source.text:
-                parsed = await self.parser.parse_from_text(paper_source.text)
+                if paper_source.content_meta:
+                    parsed = await self.parser.parse_from_jsonl_record(
+                        content=paper_source.text,
+                        content_meta=paper_source.content_meta,
+                        abstract=paper_source.abstract,
+                    )
+                else:
+                    parsed = await self.parser.parse_from_text(paper_source.text)
             else:
                 raise ValueError("PaperSource must have either pdf_path or text")
 
@@ -146,6 +155,7 @@ class IncrementalKGBuilder:
             parsed.year = paper_source.year or parsed.year
             parsed.venue = paper_source.venue or parsed.venue
             parsed.authors = paper_source.authors or parsed.authors
+            parsed.openreview_id = paper_source.paper_id  # OpenReview ID
 
             # Create Paper node
             await self.neo4j.upsert_paper(
@@ -157,7 +167,7 @@ class IncrementalKGBuilder:
             )
 
             # ---- Step 2: Entity Extraction ----
-            logger.info("[2/5] Extracting entities for %s", parsed.paper_id)
+            logger.info("[2/6] Extracting entities for %s", parsed.paper_id)
             entity_result = await self.entity_extractor.extract(parsed)
 
             # Cross-paper deduplication
@@ -209,7 +219,7 @@ class IncrementalKGBuilder:
                     result.errors.append(msg)
 
             # ---- Step 3: Citation Classification ----
-            logger.info("[3/5] Classifying citations for %s", parsed.paper_id)
+            logger.info("[3/6] Classifying citations for %s", parsed.paper_id)
             citations = await self.citation_builder.classify_citations(parsed)
 
             for citation in citations:
@@ -251,7 +261,7 @@ class IncrementalKGBuilder:
                 logger.debug("Semantic Scholar enrichment skipped for %s: %s", parsed.paper_id, e)
 
             # ---- Step 4: Argumentation Chain ----
-            logger.info("[4/5] Extracting argumentation for %s", parsed.paper_id)
+            logger.info("[4/6] Extracting argumentation for %s", parsed.paper_id)
             arg_graph = await self.argumentation_extractor.extract(parsed)
 
             # Store in Neo4j
@@ -269,8 +279,47 @@ class IncrementalKGBuilder:
             # Store claim and evidence embeddings in Qdrant
             await self._store_argumentation_embeddings(arg_graph)
 
-            # ---- Step 5: Cross-Layer Linking ----
-            logger.info("[5/5] Cross-layer linking for %s", parsed.paper_id)
+            # ---- Step 5: Peer Review Extraction ----
+            if paper_source.related_notes_raw:
+                logger.info("[5/6] Extracting peer reviews for %s", parsed.paper_id)
+                try:
+                    reviews = self.peer_review_extractor.extract(
+                        paper_source.related_notes_raw
+                    )
+                    if reviews:
+                        # Store decision as metadata
+                        decision = self.peer_review_extractor.get_decision(reviews)
+                        if decision:
+                            logger.info(
+                                "Paper %s decision: %s", parsed.paper_id, decision
+                            )
+
+                        # Convert reviews to claims/evidences
+                        pr_claims, pr_evidences = (
+                            self.peer_review_extractor.to_claims_and_evidences(
+                                reviews, parsed.paper_id
+                            )
+                        )
+                        # Merge into argumentation graph
+                        arg_graph.claims.extend(pr_claims)
+                        arg_graph.evidences.extend(pr_evidences)
+                        result.claims_added += len(pr_claims)
+                        result.evidences_added += len(pr_evidences)
+                        logger.info(
+                            "Added %d peer-review claims, %d evidences for %s",
+                            len(pr_claims),
+                            len(pr_evidences),
+                            parsed.paper_id,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Peer review extraction failed for %s: %s",
+                        parsed.paper_id,
+                        e,
+                    )
+
+            # ---- Step 6: Cross-Layer Linking ----
+            logger.info("[6/6] Cross-layer linking for %s", parsed.paper_id)
             await self._cross_layer_link(parsed.paper_id, entity_result, arg_graph)
 
             # Store section embeddings

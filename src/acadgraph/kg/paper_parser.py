@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from acadgraph.kg.schema import FigureRef, ParsedPaper, Reference, TableData
+from acadgraph.kg.schema import FigureRef, ParsedPaper, Reference, SectionTreeNode, TableData
 from acadgraph.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
@@ -107,6 +107,85 @@ class PaperParser:
             paper.sections = await self._llm_section_split(full_text)
 
         return paper
+
+    async def parse_from_jsonl_record(
+        self,
+        content: str,
+        content_meta: dict | None = None,
+        abstract: str = "",
+    ) -> ParsedPaper:
+        """Parse from pre-extracted JSONL data. No PDF/OCR needed.
+
+        Args:
+            content: Full Markdown text of the paper.
+            content_meta: Structured metadata with table_of_contents.
+            abstract: Pre-extracted abstract text.
+        """
+        paper = await self.parse_from_text(content)
+
+        # Override abstract with the clean version if provided
+        if abstract:
+            paper.abstract_raw = abstract
+            if "abstract" not in paper.sections or not paper.sections["abstract"]:
+                paper.sections["abstract"] = abstract
+
+        # Build section tree from content_meta
+        if content_meta and "table_of_contents" in content_meta:
+            paper.section_tree = self._build_section_tree(
+                content_meta["table_of_contents"]
+            )
+
+        return paper
+
+    @staticmethod
+    def _build_section_tree(
+        toc_entries: list[dict],
+    ) -> list[SectionTreeNode]:
+        """Convert content_meta table_of_contents into SectionTreeNode tree.
+
+        Each entry has: {title, heading_level, page_id, polygon}.
+        Uses heading_level to build hierarchy.
+        """
+        if not toc_entries:
+            return []
+
+        nodes: list[SectionTreeNode] = []
+        stack: list[tuple[int, SectionTreeNode]] = []  # (level, node)
+
+        for entry in toc_entries:
+            title = entry.get("title", "").replace("\n", " ").strip()
+            if not title:
+                continue
+
+            level = entry.get("heading_level")
+            if level is None:
+                # Infer level: titles with numbered sections like "1.2.3"
+                # get deeper levels
+                import re as _re
+                num_match = _re.match(r"^(\d+(?:\.\d+)*)\s", title)
+                if num_match:
+                    level = len(num_match.group(1).split("."))
+                else:
+                    level = 1
+
+            node = SectionTreeNode(
+                title=title,
+                heading_level=level,
+                page_id=entry.get("page_id"),
+            )
+
+            # Find parent: walk stack backwards to find a node with lower level
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+
+            if stack:
+                stack[-1][1].children.append(node)
+            else:
+                nodes.append(node)
+
+            stack.append((level, node))
+
+        return nodes
 
     async def _pdf_to_text(self, pdf_path: str) -> str:
         """Convert PDF to text using marker, fallback to pymupdf4llm."""
