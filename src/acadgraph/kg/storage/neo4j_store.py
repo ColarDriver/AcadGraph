@@ -566,19 +566,30 @@ class Neo4jKGStore(KgRepository):
                     ],
                 })
 
-            # ---- Problem → Gap links (batch cartesian) ----
+            # ---- Problem → Gap links (precise mapping or fallback cartesian) ----
             if arg.problems and arg.gaps:
-                pairs = [
-                    {"prob_id": p.problem_id, "gap_id": g.gap_id}
-                    for p in arg.problems
-                    for g in arg.gaps
-                ]
-                await session.run("""
-                    UNWIND $pairs AS pair
-                    MATCH (pr:Problem {problem_id: pair.prob_id})
-                    MATCH (g:Gap {gap_id: pair.gap_id})
-                    MERGE (pr)-[:HAS_GAP]->(g)
-                """, {"pairs": pairs})
+                problem_gap_map = getattr(arg, "_problem_gap_map", {})
+                if problem_gap_map:
+                    pairs = [
+                        {"prob_id": arg.problems[pidx].problem_id, "gap_id": arg.gaps[gidx].gap_id}
+                        for pidx, gap_indices in problem_gap_map.items()
+                        for gidx in gap_indices
+                        if pidx < len(arg.problems) and gidx < len(arg.gaps)
+                    ]
+                else:
+                    # Fallback: cartesian (legacy behavior)
+                    pairs = [
+                        {"prob_id": p.problem_id, "gap_id": g.gap_id}
+                        for p in arg.problems
+                        for g in arg.gaps
+                    ]
+                if pairs:
+                    await session.run("""
+                        UNWIND $pairs AS pair
+                        MATCH (pr:Problem {problem_id: pair.prob_id})
+                        MATCH (g:Gap {gap_id: pair.gap_id})
+                        MERGE (pr)-[:HAS_GAP]->(g)
+                    """, {"pairs": pairs})
 
             # ---- Core Ideas (batch) ----
             if arg.core_ideas:
@@ -602,19 +613,29 @@ class Neo4jKGStore(KgRepository):
                     ],
                 })
 
-            # ---- Gap → CoreIdea links (batch cartesian) ----
+            # ---- Gap → CoreIdea links (precise mapping or fallback cartesian) ----
             if arg.gaps and arg.core_ideas:
-                pairs = [
-                    {"gap_id": g.gap_id, "idea_id": i.idea_id}
-                    for g in arg.gaps
-                    for i in arg.core_ideas
-                ]
-                await session.run("""
-                    UNWIND $pairs AS pair
-                    MATCH (g:Gap {gap_id: pair.gap_id})
-                    MATCH (ci:CoreIdea {idea_id: pair.idea_id})
-                    MERGE (g)-[:ADDRESSED_BY]->(ci)
-                """, {"pairs": pairs})
+                gap_idea_map = getattr(arg, "_gap_idea_map", {})
+                if gap_idea_map:
+                    pairs = [
+                        {"gap_id": arg.gaps[gidx].gap_id, "idea_id": arg.core_ideas[iidx].idea_id}
+                        for gidx, idea_indices in gap_idea_map.items()
+                        for iidx in idea_indices
+                        if gidx < len(arg.gaps) and iidx < len(arg.core_ideas)
+                    ]
+                else:
+                    pairs = [
+                        {"gap_id": g.gap_id, "idea_id": i.idea_id}
+                        for g in arg.gaps
+                        for i in arg.core_ideas
+                    ]
+                if pairs:
+                    await session.run("""
+                        UNWIND $pairs AS pair
+                        MATCH (g:Gap {gap_id: pair.gap_id})
+                        MATCH (ci:CoreIdea {idea_id: pair.idea_id})
+                        MERGE (g)-[:ADDRESSED_BY]->(ci)
+                    """, {"pairs": pairs})
 
             # ---- Claims (batch) ----
             if arg.claims:
@@ -642,22 +663,34 @@ class Neo4jKGStore(KgRepository):
                     ],
                 })
 
-            # ---- CoreIdea → Claim links (batch cartesian) ----
+            # ---- CoreIdea → Claim links (precise mapping or fallback cartesian) ----
             if arg.core_ideas and arg.claims:
-                pairs = [
-                    {"idea_id": i.idea_id, "claim_id": c.claim_id}
-                    for i in arg.core_ideas
-                    for c in arg.claims
-                ]
-                await session.run("""
-                    UNWIND $pairs AS pair
-                    MATCH (ci:CoreIdea {idea_id: pair.idea_id})
-                    MATCH (cl:Claim {claim_id: pair.claim_id})
-                    MERGE (ci)-[:MAKES_CLAIM]->(cl)
-                """, {"pairs": pairs})
+                idea_claim_map = getattr(arg, "_idea_claim_map", {})
+                if idea_claim_map:
+                    pairs = [
+                        {"idea_id": arg.core_ideas[iidx].idea_id, "claim_id": arg.claims[cidx].claim_id}
+                        for iidx, claim_indices in idea_claim_map.items()
+                        for cidx in claim_indices
+                        if iidx < len(arg.core_ideas) and cidx < len(arg.claims)
+                    ]
+                else:
+                    pairs = [
+                        {"idea_id": i.idea_id, "claim_id": c.claim_id}
+                        for i in arg.core_ideas
+                        for c in arg.claims
+                    ]
+                if pairs:
+                    await session.run("""
+                        UNWIND $pairs AS pair
+                        MATCH (ci:CoreIdea {idea_id: pair.idea_id})
+                        MATCH (cl:Claim {claim_id: pair.claim_id})
+                        MERGE (ci)-[:MAKES_CLAIM]->(cl)
+                    """, {"pairs": pairs})
 
-            # ---- Evidence (batch) — includes numeric_results ----
+            # ---- Evidence (batch) — includes numeric_results + consistency ----
             if arg.evidences:
+                consistency_issues = getattr(arg, "numeric_consistency_issues", [])
+                consistency_json = _json.dumps(consistency_issues, ensure_ascii=False) if consistency_issues else "[]"
                 await session.run("""
                     UNWIND $items AS item
                     MERGE (e:Evidence {evidence_id: item.evidence_id})
@@ -666,9 +699,11 @@ class Neo4jKGStore(KgRepository):
                         e.datasets = item.datasets,
                         e.metrics = item.metrics,
                         e.numeric_results = item.numeric_results,
+                        e.numeric_consistency_issues = $consistency_json,
                         e.source_paper_id = $paper_id
                 """, {
                     "paper_id": paper_id,
+                    "consistency_json": consistency_json,
                     "items": [
                         {
                             "evidence_id": evid.evidence_id,

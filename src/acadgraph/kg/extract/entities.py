@@ -10,6 +10,7 @@ from different sections (e.g., DATASET from experiments, METHOD from method).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -92,6 +93,8 @@ class EntityExtractor:
         self._qdrant = qdrant
         # In-memory entity name → entity mapping for cross-paper dedup
         self._entity_cache: dict[str, Entity] = {}
+        # Lock to protect _entity_cache during concurrent batch processing
+        self._cache_lock = asyncio.Lock()
 
     async def extract(self, parsed_paper: ParsedPaper) -> EntityExtractionResult:
         """
@@ -216,68 +219,71 @@ class EntityExtractor:
         Uses the existing Qdrant ENTITY_COLLECTION for efficient nearest-
         neighbour lookup instead of brute-force O(N×M) embedding comparisons.
         Falls back to exact-name matching if Qdrant is unavailable.
+
+        Thread-safe: acquires ``_cache_lock`` to prevent races in batch mode.
         """
-        if not self._entity_cache:
-            # First paper — no dedup needed, just cache
+        async with self._cache_lock:
+            if not self._entity_cache:
+                # First paper — no dedup needed, just cache
+                for entity in new_entities:
+                    self._entity_cache[entity.name.lower()] = entity
+                return new_entities
+
+            result: list[Entity] = []
             for entity in new_entities:
-                self._entity_cache[entity.name.lower()] = entity
-            return new_entities
+                normalized = entity.name.strip().lower()
 
-        result: list[Entity] = []
-        for entity in new_entities:
-            normalized = entity.name.strip().lower()
+                # Exact name match
+                if normalized in self._entity_cache:
+                    cached = self._entity_cache[normalized]
+                    entity.entity_id = cached.entity_id
+                    # Merge descriptions if new one is longer
+                    if len(entity.description) > len(cached.description):
+                        cached.description = entity.description
+                    result.append(entity)
+                    continue
 
-            # Exact name match
-            if normalized in self._entity_cache:
-                cached = self._entity_cache[normalized]
-                entity.entity_id = cached.entity_id
-                # Merge descriptions if new one is longer
-                if len(entity.description) > len(cached.description):
-                    cached.description = entity.description
-                result.append(entity)
-                continue
-
-            # ANN-based similarity check via Qdrant
-            if self._qdrant:
-                try:
-                    entity_text = f"{entity.entity_type.value}: {entity.name}. {entity.description}"
-                    entity_emb = await self._embedding.embed(entity_text)
-                    hits = await self._qdrant.search_similar(
-                        ENTITY_COLLECTION,
-                        entity_emb,
-                        k=3,
-                        filters={"doc_kind": DOC_KIND_ENTITY, "entity_type": entity.entity_type.value},
-                    )
-
-                    best_match: Entity | None = None
-                    for hit in hits:
-                        if hit.get("score", 0) >= threshold:
-                            hit_name = hit.get("payload", {}).get("name", "").lower()
-                            if hit_name in self._entity_cache:
-                                candidate = self._entity_cache[hit_name]
-                                if candidate.entity_type == entity.entity_type:
-                                    best_match = candidate
-                                    break
-
-                    if best_match:
-                        entity.entity_id = best_match.entity_id
-                        logger.debug(
-                            "Dedup merged '%s' → '%s' (ANN)",
-                            entity.name, best_match.name,
+                # ANN-based similarity check via Qdrant
+                if self._qdrant:
+                    try:
+                        entity_text = f"{entity.entity_type.value}: {entity.name}. {entity.description}"
+                        entity_emb = await self._embedding.embed(entity_text)
+                        hits = await self._qdrant.search_similar(
+                            ENTITY_COLLECTION,
+                            entity_emb,
+                            k=3,
+                            filters={"doc_kind": DOC_KIND_ENTITY, "entity_type": entity.entity_type.value},
                         )
-                    else:
+
+                        best_match: Entity | None = None
+                        for hit in hits:
+                            if hit.get("score", 0) >= threshold:
+                                hit_name = hit.get("payload", {}).get("name", "").lower()
+                                if hit_name in self._entity_cache:
+                                    candidate = self._entity_cache[hit_name]
+                                    if candidate.entity_type == entity.entity_type:
+                                        best_match = candidate
+                                        break
+
+                        if best_match:
+                            entity.entity_id = best_match.entity_id
+                            logger.debug(
+                                "Dedup merged '%s' → '%s' (ANN)",
+                                entity.name, best_match.name,
+                            )
+                        else:
+                            self._entity_cache[normalized] = entity
+
+                    except Exception as e:
+                        logger.warning("ANN dedup failed for '%s': %s", entity.name, e)
                         self._entity_cache[normalized] = entity
-
-                except Exception as e:
-                    logger.warning("ANN dedup failed for '%s': %s", entity.name, e)
+                else:
+                    # No Qdrant available — fallback to cache-only exact match
                     self._entity_cache[normalized] = entity
-            else:
-                # No Qdrant available — fallback to cache-only exact match
-                self._entity_cache[normalized] = entity
 
-            result.append(entity)
+                result.append(entity)
 
-        return result
+            return result
 
     @staticmethod
     def _cosine_sim(a: list[float], b: list[float]) -> float:

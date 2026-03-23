@@ -13,6 +13,8 @@ import json
 import logging
 from typing import Any
 
+from pydantic import BaseModel, Field, ValidationError
+
 from acadgraph.kg.prompts.loader import load_prompt, render_prompt
 from acadgraph.kg.schema import (
     ArgumentationGraph,
@@ -97,6 +99,69 @@ _ROLE_MAP: dict[str, RhetoricalRole] = {
     "LIMITATION": RhetoricalRole.LIMITATION,
     "FUTURE": RhetoricalRole.FUTURE,
 }
+
+
+# ========================================================================
+# Pydantic Response Validation Models
+# ========================================================================
+
+
+class _ProblemResponse(BaseModel):
+    description: str = ""
+    scope: str = ""
+    importance_signal: str = ""
+    gap_ids: list[int] = Field(default_factory=list, description="Indices into the gaps list this problem maps to")
+
+
+class _GapResponse(BaseModel):
+    failure_mode: str = ""
+    constraint: str = ""
+    prior_methods_failing: list[str] = Field(default_factory=list)
+    core_idea_ids: list[int] = Field(default_factory=list, description="Indices into the core_ideas list")
+
+
+class _CoreIdeaResponse(BaseModel):
+    mechanism: str = ""
+    novelty_type: str = "NEW_MECHANISM"
+    key_innovation: str = ""
+    claim_ids: list[int] = Field(default_factory=list, description="Indices into the claims list")
+
+
+class _ClaimResponse(BaseModel):
+    text: str = ""
+    type: str = "PERFORMANCE"
+    severity: str = "P1"
+    source_section: str = ""
+
+
+class _SchemaExtractionResponse(BaseModel):
+    """Validated LLM response for Pass 2 schema extraction."""
+    problems: list[_ProblemResponse] = Field(default_factory=list)
+    problem: _ProblemResponse | None = None  # backward compat: single problem
+    gaps: list[_GapResponse] = Field(default_factory=list)
+    gap: _GapResponse | None = None  # backward compat: single gap
+    core_ideas: list[_CoreIdeaResponse] = Field(default_factory=list)
+    core_idea: _CoreIdeaResponse | None = None  # backward compat: single core_idea
+    claims: list[_ClaimResponse] = Field(default_factory=list)
+
+
+class _EvidenceLinkResponse(BaseModel):
+    claim_index: int = -1
+    evidences: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class _NumericConsistencyIssue(BaseModel):
+    claim_text: str = ""
+    claimed_value: str | None = None
+    table_value: str | None = None
+    consistent: bool = True
+
+
+class _EvidenceLinkingResponse(BaseModel):
+    """Validated LLM response for Pass 3 evidence linking."""
+    evidence_links: list[_EvidenceLinkResponse] = Field(default_factory=list)
+    baselines: list[dict[str, Any]] = Field(default_factory=list)
+    numeric_consistency_issues: list[_NumericConsistencyIssue] = Field(default_factory=list)
 
 
 class ArgumentationExtractor:
@@ -235,57 +300,92 @@ class ArgumentationExtractor:
         )
 
         try:
-            result = await self._llm.complete_json(prompt, system_prompt=SCHEMA_SYSTEM)
+            raw_result = await self._llm.complete_json(prompt, system_prompt=SCHEMA_SYSTEM)
         except Exception as e:
             logger.error("Schema extraction failed for %s: %s", paper_id, e)
             return ArgumentationGraph(paper_id=paper_id)
 
-        # Parse PROBLEM
+        # Validate with Pydantic
+        try:
+            result = _SchemaExtractionResponse.model_validate(raw_result)
+        except ValidationError as e:
+            logger.warning("Schema response validation failed for %s, using raw: %s", paper_id, e)
+            result = _SchemaExtractionResponse()  # fallback to empty
+
+        # Parse PROBLEMs — support both single and multiple
         problems: list[Problem] = []
-        prob_data = result.get("problem", {})
-        if prob_data:
+        all_problems = list(result.problems)
+        if result.problem and not all_problems:
+            all_problems.append(result.problem)
+        for prob_data in all_problems:
             problems.append(Problem(
-                description=prob_data.get("description", ""),
-                scope=prob_data.get("scope", ""),
-                importance_signal=prob_data.get("importance_signal", ""),
+                description=prob_data.description,
+                scope=prob_data.scope,
+                importance_signal=prob_data.importance_signal,
                 source_paper_id=paper_id,
             ))
 
-        # Parse GAP
+        # Parse GAPs — support both single and multiple
         gaps: list[Gap] = []
-        gap_data = result.get("gap", {})
-        if gap_data:
+        all_gaps = list(result.gaps)
+        if result.gap and not all_gaps:
+            all_gaps.append(result.gap)
+        for gap_data in all_gaps:
             gaps.append(Gap(
-                failure_mode=gap_data.get("failure_mode", ""),
-                constraint=gap_data.get("constraint", ""),
-                prior_methods_failing=gap_data.get("prior_methods_failing", []),
+                failure_mode=gap_data.failure_mode,
+                constraint=gap_data.constraint,
+                prior_methods_failing=gap_data.prior_methods_failing,
                 source_paper_id=paper_id,
             ))
 
-        # Parse CORE_IDEA
+        # Parse CORE_IDEAs — support both single and multiple
         core_ideas: list[CoreIdea] = []
-        idea_data = result.get("core_idea", {})
-        if idea_data:
-            novelty_str = idea_data.get("novelty_type", "NEW_MECHANISM").upper()
+        all_ideas = list(result.core_ideas)
+        if result.core_idea and not all_ideas:
+            all_ideas.append(result.core_idea)
+        for idea_data in all_ideas:
+            novelty_str = idea_data.novelty_type.upper()
             core_ideas.append(CoreIdea(
-                mechanism=idea_data.get("mechanism", ""),
+                mechanism=idea_data.mechanism,
                 novelty_type=_NOVELTY_MAP.get(novelty_str, NoveltyType.NEW_MECHANISM),
-                key_innovation=idea_data.get("key_innovation", ""),
+                key_innovation=idea_data.key_innovation,
                 source_paper_id=paper_id,
             ))
 
         # Parse CLAIMs
         claims: list[Claim] = []
-        for raw_claim in result.get("claims", []):
-            claim_type_str = raw_claim.get("type", "PERFORMANCE").upper()
-            severity_str = raw_claim.get("severity", "P1").upper()
+        for raw_claim in result.claims:
+            claim_type_str = raw_claim.type.upper()
+            severity_str = raw_claim.severity.upper()
             claims.append(Claim(
-                text=raw_claim.get("text", ""),
+                text=raw_claim.text,
                 claim_type=_CLAIM_TYPE_MAP.get(claim_type_str, ClaimType.PERFORMANCE),
                 severity=_SEVERITY_MAP.get(severity_str, ClaimSeverity.P1),
-                source_section=raw_claim.get("source_section", ""),
+                source_section=raw_claim.source_section,
                 source_paper_id=paper_id,
             ))
+
+        # Build precise mappings (Problem→Gap, Gap→CoreIdea, CoreIdea→Claim)
+        problem_gap_map: dict[int, list[int]] = {}
+        for prob_idx, prob_data in enumerate(all_problems):
+            if prob_data.gap_ids:
+                problem_gap_map[prob_idx] = [
+                    gid for gid in prob_data.gap_ids if 0 <= gid < len(gaps)
+                ]
+
+        gap_idea_map: dict[int, list[int]] = {}
+        for gap_idx, gap_data in enumerate(all_gaps):
+            if gap_data.core_idea_ids:
+                gap_idea_map[gap_idx] = [
+                    iid for iid in gap_data.core_idea_ids if 0 <= iid < len(core_ideas)
+                ]
+
+        idea_claim_map: dict[int, list[int]] = {}
+        for idea_idx, idea_data in enumerate(all_ideas):
+            if idea_data.claim_ids:
+                idea_claim_map[idea_idx] = [
+                    cid for cid in idea_data.claim_ids if 0 <= cid < len(claims)
+                ]
 
         # Extract limitations from zoned paragraphs
         limitations: list[Limitation] = []
@@ -298,7 +398,7 @@ class ArgumentationExtractor:
                     source_paper_id=paper_id,
                 ))
 
-        return ArgumentationGraph(
+        arg_graph = ArgumentationGraph(
             paper_id=paper_id,
             problems=problems,
             gaps=gaps,
@@ -306,6 +406,13 @@ class ArgumentationExtractor:
             claims=claims,
             limitations=limitations,
         )
+
+        # Attach precise mapping metadata for storage layer
+        arg_graph._problem_gap_map = problem_gap_map  # type: ignore[attr-defined]
+        arg_graph._gap_idea_map = gap_idea_map  # type: ignore[attr-defined]
+        arg_graph._idea_claim_map = idea_claim_map  # type: ignore[attr-defined]
+
+        return arg_graph
 
     # ========================================================================
     # Pass 3: Evidence-Claim Linking
@@ -367,24 +474,31 @@ class ArgumentationExtractor:
         )
 
         try:
-            result = await self._llm.complete_json(prompt, system_prompt=EVIDENCE_SYSTEM)
+            raw_result = await self._llm.complete_json(prompt, system_prompt=EVIDENCE_SYSTEM)
         except Exception as e:
             logger.error("Evidence linking failed for %s: %s", argumentation.paper_id, e)
             return argumentation
+
+        # Validate with Pydantic
+        try:
+            result = _EvidenceLinkingResponse.model_validate(raw_result)
+        except ValidationError as e:
+            logger.warning("Evidence linking response validation failed for %s: %s", argumentation.paper_id, e)
+            result = _EvidenceLinkingResponse()
 
         # Parse evidence links
         paper_id = argumentation.paper_id
         evidences: list[Evidence] = []
         links: list[ClaimEvidenceLink] = []
 
-        for ev_link in result.get("evidence_links", []):
-            claim_idx = ev_link.get("claim_index", -1)
+        for ev_link in result.evidence_links:
+            claim_idx = ev_link.claim_index
             if claim_idx < 0 or claim_idx >= len(argumentation.claims):
                 continue
 
             claim = argumentation.claims[claim_idx]
 
-            for raw_ev in ev_link.get("evidences", []):
+            for raw_ev in ev_link.evidences:
                 ev_type_str = raw_ev.get("evidence_type", "EXPERIMENT").upper()
                 strength_str = raw_ev.get("support_strength", "UNVERIFIABLE").upper()
 
@@ -409,7 +523,7 @@ class ArgumentationExtractor:
 
         # Parse baselines
         baselines: list[Baseline] = []
-        for raw_bl in result.get("baselines", []):
+        for raw_bl in result.baselines:
             baselines.append(Baseline(
                 method_name=raw_bl.get("method_name", ""),
                 paper_ref=raw_bl.get("paper_ref", ""),
@@ -422,17 +536,27 @@ class ArgumentationExtractor:
         argumentation.claim_evidence_links = links
         argumentation.baselines = baselines
 
-        # Log numeric consistency issues
-        for issue in result.get("numeric_consistency_issues", []):
-            if not issue.get("consistent", True):
+        # Collect numeric consistency issues and attach to Evidence nodes
+        consistency_issues: list[dict[str, Any]] = []
+        for issue in result.numeric_consistency_issues:
+            if not issue.consistent:
                 logger.warning(
                     "Numeric inconsistency in paper %s: claim='%s', "
                     "claimed=%s, table=%s",
                     paper_id,
-                    issue.get("claim_text", "")[:60],
-                    issue.get("claimed_value"),
-                    issue.get("table_value"),
+                    issue.claim_text[:60],
+                    issue.claimed_value,
+                    issue.table_value,
                 )
+                consistency_issues.append({
+                    "claim_text": issue.claim_text,
+                    "claimed_value": issue.claimed_value,
+                    "table_value": issue.table_value,
+                })
+
+        # Attach consistency issues to evidences for persistence
+        if consistency_issues:
+            argumentation.numeric_consistency_issues = consistency_issues  # type: ignore[attr-defined]
 
         return argumentation
 

@@ -220,13 +220,29 @@ class CitationEvolutionBuilder:
             logger.warning("Evolution detection failed: %s", e)
             return []
 
-        # Build chains from links
+        # Build chains from links — with cycle detection
         chains: list[EvolutionChain] = []
         name_to_method = {m["method_name"].lower(): m for m in sorted_methods}
+        # Track directed edges to detect cycles
+        edge_set: set[tuple[str, str]] = set()
 
         for link in links:
             from_name = link.get("from_method", "").lower()
             to_name = link.get("to_method", "").lower()
+
+            # Skip self-loops
+            if from_name == to_name:
+                logger.warning("Skipping self-loop evolution link: %s", from_name)
+                continue
+
+            # Skip duplicate / reverse edges (cycle detection)
+            if (to_name, from_name) in edge_set:
+                logger.warning(
+                    "Skipping evolution link %s → %s: would create a cycle",
+                    from_name, to_name,
+                )
+                continue
+
             from_method = name_to_method.get(from_name)
             to_method = name_to_method.get(to_name)
 
@@ -250,6 +266,7 @@ class CitationEvolutionBuilder:
                     ],
                 )
                 chains.append(chain)
+                edge_set.add((from_name, to_name))
 
         return chains
 
