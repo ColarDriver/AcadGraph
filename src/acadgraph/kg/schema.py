@@ -77,6 +77,19 @@ class SectionTreeNode:
     heading_level: int | None = None
     page_id: int | None = None
     children: list["SectionTreeNode"] = field(default_factory=list)
+    # --- PageIndex integration fields ---
+    node_id: str = ""                # Unique ID, e.g. "sec_001"
+    content: str = ""                # Section text content
+    summary: str = ""                # LLM-generated summary
+    start_page: int | None = None    # Start page number
+    end_page: int | None = None      # End page number
+    section_key: str = ""            # Corresponding key in sections dict
+    claim_ids: list[str] = field(default_factory=list)
+    evidence_ids: list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.node_id:
+            self.node_id = generate_id("sec")
 
 
 @dataclass

@@ -12,6 +12,7 @@ from acadgraph.kg.schema import (
     Entity,
     EntityRelation,
     EvolutionStep,
+    SectionTreeNode,
 )
 
 
@@ -49,6 +50,23 @@ class KgRepository(Protocol):
 
     async def store_argumentation(self, paper_id: str, arg: ArgumentationGraph) -> None:
         """Store a full argumentation graph for one paper."""
+
+    async def upsert_section_tree(
+        self,
+        paper_id: str,
+        section_tree: list[SectionTreeNode],
+    ) -> None:
+        """Store hierarchical section tree for a paper."""
+
+    async def get_section_tree(self, paper_id: str) -> list[dict[str, Any]]:
+        """Get a paper's section tree for Tree Search retrieval."""
+
+    async def link_claim_to_section(
+        self,
+        claim_id: str,
+        section_node_id: str,
+    ) -> None:
+        """Link a claim to the section it appears in."""
 
     async def get_claim_evidence_ledger(self, paper_id: str) -> ClaimEvidenceLedger:
         """Query claim-evidence ledger by paper."""

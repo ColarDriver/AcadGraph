@@ -129,52 +129,129 @@ class PaperParser:
             if "abstract" not in paper.sections or not paper.sections["abstract"]:
                 paper.sections["abstract"] = abstract
 
-        # Build section tree from content_meta
-        if content_meta and "table_of_contents" in content_meta:
-            paper.section_tree = self._build_section_tree(
-                content_meta["table_of_contents"]
-            )
+        # Build enhanced section tree:
+        # Priority: Markdown headings (most reliable) → content_meta ToC → number inference
+        md_entries = self._infer_heading_levels_from_markdown(content)
+
+        if md_entries and len(md_entries) > 2:
+            # Use Markdown heading levels (most accurate)
+            paper.section_tree = self._build_section_tree(md_entries)
+        elif content_meta and "table_of_contents" in content_meta:
+            # Fallback to content_meta ToC, enriched with markdown info
+            toc = content_meta["table_of_contents"]
+            enriched = self._enrich_toc_with_markdown(toc, md_entries)
+            paper.section_tree = self._build_section_tree(enriched)
+        else:
+            paper.section_tree = []
+
+        # Attach section content to tree nodes
+        if paper.section_tree:
+            self._attach_content_to_tree(paper.section_tree, content)
+            # Map tree nodes to standard section keys
+            self._assign_section_keys(paper.section_tree)
 
         return paper
 
     @staticmethod
-    def _build_section_tree(
-        toc_entries: list[dict],
-    ) -> list[SectionTreeNode]:
-        """Convert content_meta table_of_contents into SectionTreeNode tree.
+    def _infer_heading_levels_from_markdown(text: str) -> list[dict]:
+        """Infer heading levels from Markdown # markers.
 
-        Each entry has: {title, heading_level, page_id, polygon}.
-        Uses heading_level to build hierarchy.
+        # Title → level 1
+        ## Section → level 2
+        ### Subsection → level 3
+
+        Returns list of {title, heading_level, line_pos} dicts.
         """
-        if not toc_entries:
+        entries = []
+        for i, line in enumerate(text.split("\n")):
+            stripped = line.strip()
+            m = re.match(r"^(#{1,6})\s+(.+)", stripped)
+            if m:
+                entries.append({
+                    "title": m.group(2).strip(),
+                    "heading_level": len(m.group(1)),
+                    "line_num": i,
+                })
+        return entries
+
+    @staticmethod
+    def _enrich_toc_with_markdown(
+        toc_entries: list[dict],
+        md_entries: list[dict],
+    ) -> list[dict]:
+        """Enrich content_meta ToC with heading levels from Markdown.
+
+        Matches by title similarity and assigns markdown-inferred levels
+        to ToC entries that have heading_level=None.
+        """
+        if not md_entries:
+            return toc_entries
+
+        # Build a lookup: normalized title → heading level
+        md_levels: dict[str, int] = {}
+        for entry in md_entries:
+            key = re.sub(r"\s+", " ", entry["title"]).strip().lower()
+            md_levels[key] = entry["heading_level"]
+
+        enriched = []
+        for entry in toc_entries:
+            entry = dict(entry)  # Don't mutate original
+            if entry.get("heading_level") is None:
+                title_key = re.sub(
+                    r"\s+", " ", entry.get("title", "")
+                ).strip().lower()
+                if title_key in md_levels:
+                    entry["heading_level"] = md_levels[title_key]
+            enriched.append(entry)
+
+        return enriched
+
+    @staticmethod
+    def _build_section_tree(
+        entries: list[dict],
+    ) -> list[SectionTreeNode]:
+        """Build hierarchical SectionTreeNode tree from heading entries.
+
+        Priority chain for heading_level:
+        1. Explicit heading_level (from Markdown # or content_meta)
+        2. Section number inference (1→L1, 1.1→L2, 1.1.1→L3)
+        3. Default: same level as previous entry
+        """
+        if not entries:
             return []
 
         nodes: list[SectionTreeNode] = []
         stack: list[tuple[int, SectionTreeNode]] = []  # (level, node)
 
-        for entry in toc_entries:
+        for entry in entries:
             title = entry.get("title", "").replace("\n", " ").strip()
             if not title:
                 continue
 
+            # Priority chain for level inference
             level = entry.get("heading_level")
             if level is None:
-                # Infer level: titles with numbered sections like "1.2.3"
-                # get deeper levels
-                import re as _re
-                num_match = _re.match(r"^(\d+(?:\.\d+)*)\s", title)
+                # Try section number inference: "1.2.3 Title" → level 3
+                num_match = re.match(r"^(\d+(?:\.\d+)*)\s", title)
                 if num_match:
                     level = len(num_match.group(1).split("."))
                 else:
-                    level = 1
+                    # Heuristic: unnumbered ALL-CAPS titles are likely L1
+                    clean = re.sub(r"[^a-zA-Z\s]", "", title)
+                    if clean and clean == clean.upper() and len(clean) > 3:
+                        level = 1
+                    else:
+                        # Same level as previous, or L1 default
+                        level = stack[-1][0] if stack else 1
 
             node = SectionTreeNode(
                 title=title,
                 heading_level=level,
                 page_id=entry.get("page_id"),
+                start_page=entry.get("page_id"),
             )
 
-            # Find parent: walk stack backwards to find a node with lower level
+            # Build hierarchy: walk stack backwards to find parent
             while stack and stack[-1][0] >= level:
                 stack.pop()
 
@@ -186,6 +263,113 @@ class PaperParser:
             stack.append((level, node))
 
         return nodes
+
+    @staticmethod
+    def _attach_content_to_tree(
+        tree: list[SectionTreeNode],
+        raw_text: str,
+    ) -> None:
+        """Attach section text content to tree nodes by matching headings.
+
+        Finds each node's title in the raw text and extracts content
+        until the next heading of same or higher level.
+        """
+        if not raw_text or not tree:
+            return
+
+        # Collect all nodes in DFS order
+        all_nodes: list[SectionTreeNode] = []
+
+        def _collect(nodes: list[SectionTreeNode]) -> None:
+            for n in nodes:
+                all_nodes.append(n)
+                _collect(n.children)
+
+        _collect(tree)
+
+        # Find heading positions in raw text using Markdown markers
+        heading_positions: list[tuple[int, int, str]] = []  # (pos, level, title)
+        for i, line in enumerate(raw_text.split("\n")):
+            stripped = line.strip()
+            m = re.match(r"^(#{1,6})\s+(.+)", stripped)
+            if m:
+                # Find actual character position
+                pos = 0
+                for j, l in enumerate(raw_text.split("\n")):
+                    if j == i:
+                        break
+                    pos += len(l) + 1
+                heading_positions.append((pos, len(m.group(1)), m.group(2).strip()))
+
+        if not heading_positions:
+            return
+
+        # Match nodes to heading positions by title similarity
+        for node in all_nodes:
+            node_title_lower = re.sub(r"\s+", " ", node.title).strip().lower()
+
+            best_idx = -1
+            best_ratio = 0.0
+            for idx, (pos, level, htitle) in enumerate(heading_positions):
+                htitle_lower = re.sub(r"\s+", " ", htitle).strip().lower()
+                # Simple containment check
+                if (node_title_lower in htitle_lower
+                        or htitle_lower in node_title_lower
+                        or node_title_lower == htitle_lower):
+                    ratio = 1.0
+                else:
+                    # Partial match ratio
+                    common = len(set(node_title_lower.split()) & set(htitle_lower.split()))
+                    total = max(len(node_title_lower.split()), len(htitle_lower.split()), 1)
+                    ratio = common / total
+
+                if ratio > best_ratio and ratio > 0.5:
+                    best_ratio = ratio
+                    best_idx = idx
+
+            if best_idx >= 0:
+                start_pos = heading_positions[best_idx][0]
+                start_level = heading_positions[best_idx][1]
+
+                # Find end: next heading at same or higher (lower number) level
+                end_pos = len(raw_text)
+                for idx in range(best_idx + 1, len(heading_positions)):
+                    if heading_positions[idx][1] <= start_level:
+                        end_pos = heading_positions[idx][0]
+                        break
+
+                # Extract content (skip the heading line itself)
+                heading_end = raw_text.find("\n", start_pos)
+                if heading_end != -1 and heading_end < end_pos:
+                    content = raw_text[heading_end + 1 : end_pos].strip()
+                    # Truncate very long sections to avoid memory issues
+                    if len(content) > 10000:
+                        content = content[:10000] + "..."
+                    node.content = content
+
+    @staticmethod
+    def _assign_section_keys(tree: list[SectionTreeNode]) -> None:
+        """Map tree node titles to standard section keys (abstract, method, etc.)."""
+        all_nodes: list[SectionTreeNode] = []
+
+        def _collect(nodes: list[SectionTreeNode]) -> None:
+            for n in nodes:
+                all_nodes.append(n)
+                _collect(n.children)
+
+        _collect(tree)
+
+        for node in all_nodes:
+            clean_title = re.sub(r"^#+\s*", "", node.title)
+            clean_title = re.sub(r"^\d+\.?\s*", "", clean_title).strip()
+
+            for section_key, patterns in _COMPILED_PATTERNS.items():
+                for pattern in patterns:
+                    if pattern.fullmatch(clean_title):
+                        node.section_key = section_key
+                        break
+                if node.section_key:
+                    break
 
     async def _pdf_to_text(self, pdf_path: str) -> str:
         """Convert PDF to text using marker, fallback to pymupdf4llm."""

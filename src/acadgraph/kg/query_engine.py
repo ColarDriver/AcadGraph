@@ -405,6 +405,33 @@ Return JSON:
                 path_payload=payload.get("section", ""),
             )
 
+        # Path 5: Tree Search — LLM-guided section tree reasoning
+        # Select top candidate papers for tree analysis
+        tree_candidates = sorted(
+            ((pid, data.get("score", 0.0)) for pid, data in all_results.items()),
+            key=lambda x: x[1],
+            reverse=True,
+        )[: min(5, max(1, k // 4))]
+
+        if tree_candidates:
+            tree_results = await self._tree_search_recall(
+                idea, [pid for pid, _ in tree_candidates]
+            )
+            for tr in tree_results:
+                _upsert_result(
+                    pid=tr.get("paper_id", ""),
+                    score=tr.get("score", 0.0),
+                    recall_path="tree_search",
+                    path_key="tree_matched_sections",
+                    path_payload=tr.get("section_title", ""),
+                )
+
+            # ---- Path 5 → Path 2 coupling ----
+            # Boost claims that live inside Tree-Search-matched sections
+            await self._boost_claims_from_tree(
+                tree_results, idea_embedding, all_results, _upsert_result
+            )
+
         # Merge scores with light path-diversity bonus.
         for data in all_results.values():
             path_scores = data.get("path_scores", {})
@@ -419,9 +446,276 @@ Return JSON:
             if matches.get("matched_sections"):
                 data["matched_section"] = matches["matched_sections"][0]
 
-        # Sort by score and return top-k
+        # Sort by score
         sorted_results = sorted(all_results.values(), key=lambda x: x["score"], reverse=True)
-        return sorted_results[:k]
+        top_k = sorted_results[:k]
+
+        # ---- Cross-path LLM re-ranking ----
+        if len(top_k) >= 3:
+            top_k = await self._cross_path_rerank(idea, top_k)
+
+        return top_k
+
+    # ========================================================================
+    # Tree Search (PageIndex-style hierarchical reasoning)
+    # ========================================================================
+
+    async def _tree_search_recall(
+        self,
+        query: str,
+        paper_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        """Path 5: LLM-guided section tree reasoning.
+
+        For each candidate paper:
+        1. Fetch section tree from Neo4j
+        2. Present tree structure to LLM
+        3. LLM reasons about which sections are most relevant
+        4. Return matched sections with scores
+
+        Inspired by PageIndex's Tree Search mechanism.
+        """
+        results: list[dict[str, Any]] = []
+
+        for paper_id in paper_ids:
+            try:
+                tree_data = await self.neo4j.get_section_tree(paper_id)
+                if not tree_data or len(tree_data) < 2:
+                    continue
+
+                # Format tree structure for LLM
+                tree_text = self._format_tree_for_llm(tree_data)
+                if not tree_text:
+                    continue
+
+                # LLM tree reasoning prompt
+                prompt = (
+                    "You are analyzing a paper's structure to find sections "
+                    "relevant to a research query.\n\n"
+                    f"## Paper Section Tree\n{tree_text}\n\n"
+                    f"## Research Query\n{query}\n\n"
+                    "## Task\n"
+                    "Identify the 1-3 most relevant sections for this query. "
+                    "Return a JSON array where each element has:\n"
+                    '- "node_id": the section node_id\n'
+                    '- "title": the section title\n'
+                    '- "relevance": a float 0.0-1.0\n'
+                    '- "reason": one sentence explaining WHY this section is relevant\n\n'
+                    "Return ONLY the JSON array, no other text."
+                )
+
+                response = await self.llm.generate(prompt)
+                matched = self._parse_tree_search_response(response)
+
+                for match in matched:
+                    score = min(0.9, 0.4 + 0.5 * match.get("relevance", 0.5))
+                    results.append({
+                        "paper_id": paper_id,
+                        "score": score,
+                        "section_title": match.get("title", ""),
+                        "section_node_id": match.get("node_id", ""),
+                        "tree_reason": match.get("reason", ""),
+                    })
+
+            except Exception as e:
+                logger.debug(
+                    "Tree search failed for paper %s: %s", paper_id, e
+                )
+
+        return results
+
+    @staticmethod
+    def _format_tree_for_llm(tree_data: list[dict]) -> str:
+        """Format flat section list into indented tree text for LLM."""
+        if not tree_data:
+            return ""
+
+        lines = []
+        for sec in tree_data:
+            level = sec.get("heading_level") or 1
+            indent = "  " * (level - 1)
+            node_id = sec.get("node_id", "?")
+            title = sec.get("title", "Untitled")
+            sk = sec.get("section_key", "")
+            key_tag = f" [{sk}]" if sk else ""
+            lines.append(f"{indent}- [{node_id}] {title}{key_tag}")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_tree_search_response(response: str) -> list[dict]:
+        """Parse LLM tree search response into list of matched sections."""
+        if not response:
+            return []
+
+        # Try to extract JSON array from response
+        text = response.strip()
+
+        # Handle markdown code blocks
+        if "```" in text:
+            import re
+            match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+            if match:
+                text = match.group(1).strip()
+
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [
+                    item for item in parsed
+                    if isinstance(item, dict) and "node_id" in item
+                ]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        return []
+
+    async def _boost_claims_from_tree(
+        self,
+        tree_results: list[dict[str, Any]],
+        query_embedding: list[float],
+        all_results: dict[str, dict[str, Any]],
+        upsert_fn: Any,
+    ) -> None:
+        """Path 5 → Path 2 coupling.
+
+        For sections identified by Tree Search, find claims within those
+        sections (via Neo4j CONTAINS_CLAIM) and boost their papers' scores.
+        """
+        for tr in tree_results:
+            section_node_id = tr.get("section_node_id", "")
+            paper_id = tr.get("paper_id", "")
+            tree_score = tr.get("score", 0.0)
+
+            if not section_node_id:
+                continue
+
+            try:
+                # Query Neo4j: which claims are in this section?
+                async with self.neo4j.driver.session() as session:
+                    result = await session.run("""
+                        MATCH (s:Section {node_id: $node_id})-[:CONTAINS_CLAIM]->(c:Claim)
+                        RETURN c.claim_id AS claim_id, c.text AS text,
+                               c.claim_type AS claim_type
+                        LIMIT 5
+                    """, {"node_id": section_node_id})
+                    claims = await result.data()
+
+                if not claims:
+                    continue
+
+                # Boost: claims from tree-matched sections get a coupled score
+                for claim in claims:
+                    coupled_score = min(0.95, tree_score * 0.8 + 0.15)
+                    upsert_fn(
+                        pid=paper_id,
+                        score=coupled_score,
+                        recall_path="tree_claim_coupling",
+                        path_key="tree_coupled_claims",
+                        path_payload=claim.get("claim_type", ""),
+                    )
+
+            except Exception as e:
+                logger.debug(
+                    "Tree→Claim coupling failed for section %s: %s",
+                    section_node_id, e
+                )
+
+    async def _cross_path_rerank(
+        self,
+        query: str,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Cross-path LLM re-ranking.
+
+        Present top-k candidates with their multi-path evidence to LLM
+        for holistic re-ranking that considers evidence coherence.
+        """
+        if len(candidates) < 2:
+            return candidates
+
+        # Build candidate summaries for LLM
+        candidate_lines = []
+        for i, c in enumerate(candidates[:15]):  # Cap at 15 to fit context
+            pid = c.get("paper_id", "?")
+            score = c.get("score", 0.0)
+            paths = list(c.get("path_scores", {}).keys())
+            matches = c.get("path_matches", {})
+
+            parts = [f"[{i}] paper_id={pid}, score={score:.3f}, paths={paths}"]
+
+            if matches.get("matched_entities"):
+                parts.append(f"  entities: {matches['matched_entities'][:3]}")
+            if matches.get("matched_claim_types"):
+                parts.append(f"  claims: {matches['matched_claim_types'][:3]}")
+            if matches.get("matched_sections"):
+                parts.append(f"  sections: {matches['matched_sections'][:3]}")
+            if matches.get("tree_matched_sections"):
+                parts.append(f"  tree_sections: {matches['tree_matched_sections'][:3]}")
+            if matches.get("tree_coupled_claims"):
+                parts.append(f"  tree→claims: {matches['tree_coupled_claims'][:3]}")
+            if matches.get("evolution_link_count"):
+                parts.append(f"  evolution: {matches['evolution_link_count']}")
+
+            candidate_lines.append("\n".join(parts))
+
+        prompt = (
+            "You are re-ranking paper search results for relevance.\n\n"
+            f"## Query\n{query}\n\n"
+            "## Candidates (sorted by initial score)\n"
+            + "\n\n".join(candidate_lines)
+            + "\n\n## Task\n"
+            "Re-rank these candidates by TRUE relevance to the query. "
+            "Consider:\n"
+            "- Papers matched by MORE diverse paths (entity+claim+section) "
+            "are likely more relevant\n"
+            "- Tree search matches indicate structural relevance\n"
+            "- Evolution links show field progression\n\n"
+            "Return a JSON array of indices in order of relevance "
+            "(most relevant first). Example: [3, 0, 1, 2]\n"
+            "Return ONLY the JSON array."
+        )
+
+        try:
+            response = await self.llm.generate(prompt)
+            text = response.strip()
+
+            # Handle markdown code blocks
+            if "```" in text:
+                import re
+                match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+                if match:
+                    text = match.group(1).strip()
+
+            indices = json.loads(text)
+            if isinstance(indices, list) and all(isinstance(i, int) for i in indices):
+                # Reorder candidates by LLM ranking
+                reranked = []
+                seen = set()
+                for idx in indices:
+                    if 0 <= idx < len(candidates) and idx not in seen:
+                        reranked.append(candidates[idx])
+                        seen.add(idx)
+                # Append any missed candidates at the end
+                for i, c in enumerate(candidates):
+                    if i not in seen:
+                        reranked.append(c)
+
+                # Update scores: top-ranked gets slight boost, bottom gets penalty
+                for rank, item in enumerate(reranked):
+                    rank_adjustment = 0.05 * (1.0 - rank / max(len(reranked), 1))
+                    item["score"] = min(1.0, item["score"] + rank_adjustment)
+                    item["rerank_position"] = rank
+
+                logger.debug("Cross-path rerank: %s → %s", 
+                           [c["paper_id"] for c in candidates[:5]],
+                           [c["paper_id"] for c in reranked[:5]])
+                return reranked
+
+        except Exception as e:
+            logger.debug("Cross-path rerank failed: %s", e)
+
+        return candidates
 
     # ========================================================================
     # Evolution Queries

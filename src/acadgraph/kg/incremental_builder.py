@@ -261,7 +261,7 @@ class IncrementalKGBuilder:
                 logger.debug("Semantic Scholar enrichment skipped for %s: %s", parsed.paper_id, e)
 
             # ---- Step 4: Argumentation Chain ----
-            logger.info("[4/6] Extracting argumentation for %s", parsed.paper_id)
+            logger.info("[4/7] Extracting argumentation for %s", parsed.paper_id)
             arg_graph = await self.argumentation_extractor.extract(parsed)
 
             # Store in Neo4j
@@ -279,9 +279,21 @@ class IncrementalKGBuilder:
             # Store claim and evidence embeddings in Qdrant
             await self._store_argumentation_embeddings(arg_graph)
 
+            # ---- Step 4.5: Section Tree Storage & Evidence Linking ----
+            if parsed.section_tree:
+                logger.info("[4.5/7] Storing section tree for %s", parsed.paper_id)
+                await self.neo4j.upsert_section_tree(
+                    parsed.paper_id, parsed.section_tree
+                )
+
+                # Link claims to their source sections
+                self._link_claims_to_sections(
+                    arg_graph.claims, parsed.section_tree
+                )
+
             # ---- Step 5: Peer Review Extraction ----
             if paper_source.related_notes_raw:
-                logger.info("[5/6] Extracting peer reviews for %s", parsed.paper_id)
+                logger.info("[5/7] Extracting peer reviews for %s", parsed.paper_id)
                 try:
                     reviews = self.peer_review_extractor.extract(
                         paper_source.related_notes_raw
@@ -319,10 +331,10 @@ class IncrementalKGBuilder:
                     )
 
             # ---- Step 6: Cross-Layer Linking ----
-            logger.info("[6/6] Cross-layer linking for %s", parsed.paper_id)
+            logger.info("[6/7] Cross-layer linking for %s", parsed.paper_id)
             await self._cross_layer_link(parsed.paper_id, entity_result, arg_graph)
 
-            # Store section embeddings
+            # ---- Step 7: Section Embeddings ----
             await self._store_section_embeddings(parsed)
 
         except Exception as e:
@@ -522,6 +534,55 @@ class IncrementalKGBuilder:
         await self.qdrant.upsert_embeddings_batch(
             ENTITY_COLLECTION, ids, embeddings, payloads
         )
+
+    @staticmethod
+    def _link_claims_to_sections(
+        claims: list,
+        section_tree: list,
+    ) -> None:
+        """Link claims to their source section tree nodes by matching source_section."""
+        import re
+
+        # Flatten tree to get all nodes
+        all_nodes = []
+
+        def _collect(nodes: list) -> None:
+            for n in nodes:
+                all_nodes.append(n)
+                _collect(n.children)
+
+        _collect(section_tree)
+
+        for claim in claims:
+            if not claim.source_section:
+                continue
+
+            clean_source = re.sub(r"\s+", " ", claim.source_section).strip().lower()
+
+            best_node = None
+            best_score = 0.0
+            for node in all_nodes:
+                node_title = re.sub(r"\s+", " ", node.title).strip().lower()
+                # Match by section_key or title similarity
+                if node.section_key and node.section_key == clean_source:
+                    best_node = node
+                    break
+                if (clean_source in node_title
+                        or node_title in clean_source):
+                    ratio = 1.0
+                elif node_title:
+                    common = len(set(clean_source.split()) & set(node_title.split()))
+                    total = max(len(clean_source.split()), len(node_title.split()), 1)
+                    ratio = common / total
+                else:
+                    ratio = 0.0
+
+                if ratio > best_score and ratio > 0.4:
+                    best_score = ratio
+                    best_node = node
+
+            if best_node:
+                best_node.claim_ids.append(claim.claim_id)
 
     # ========================================================================
     # Cross-Layer Linking

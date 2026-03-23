@@ -785,6 +785,121 @@ class Neo4jKGStore(KgRepository):
                     ],
                 })
 
+    # ========================================================================
+    # Section Tree
+    # ========================================================================
+
+    async def upsert_section_tree(
+        self,
+        paper_id: str,
+        section_tree: list,
+    ) -> None:
+        """Store hierarchical section tree for a paper.
+
+        Creates Section nodes with HAS_SECTION (Paper→Section) and
+        HAS_SUBSECTION (Section→Section) relationships.
+        """
+        # Flatten tree into a list of (node, parent_node_id) pairs
+        flat: list[tuple[dict, str | None]] = []
+
+        def _flatten(nodes: list, parent_id: str | None = None) -> None:
+            for node in nodes:
+                item = {
+                    "node_id": node.node_id,
+                    "title": node.title,
+                    "heading_level": node.heading_level or 1,
+                    "summary": node.summary,
+                    "section_key": node.section_key,
+                    "start_page": node.start_page,
+                    "end_page": node.end_page,
+                    # Store content hash, not full content (too large for graph)
+                    "has_content": bool(node.content),
+                }
+                flat.append((item, parent_id))
+                if node.children:
+                    _flatten(node.children, node.node_id)
+
+        _flatten(section_tree)
+
+        if not flat:
+            return
+
+        async with self.driver.session() as session:
+            # Create all Section nodes in batch
+            await session.run("""
+                UNWIND $items AS item
+                MERGE (s:Section {node_id: item.node_id})
+                SET s.title = item.title,
+                    s.heading_level = item.heading_level,
+                    s.summary = item.summary,
+                    s.section_key = item.section_key,
+                    s.start_page = item.start_page,
+                    s.end_page = item.end_page,
+                    s.has_content = item.has_content,
+                    s.paper_id = $paper_id
+            """, {
+                "paper_id": paper_id,
+                "items": [item for item, _ in flat],
+            })
+
+            # Create Paper → Section (root nodes only)
+            root_ids = [item["node_id"] for item, parent in flat if parent is None]
+            if root_ids:
+                await session.run("""
+                    MATCH (p:Paper {paper_id: $paper_id})
+                    UNWIND $node_ids AS nid
+                    MATCH (s:Section {node_id: nid})
+                    MERGE (p)-[:HAS_SECTION]->(s)
+                """, {"paper_id": paper_id, "node_ids": root_ids})
+
+            # Create Section → Section (parent → child)
+            child_pairs = [
+                {"parent_id": parent, "child_id": item["node_id"]}
+                for item, parent in flat
+                if parent is not None
+            ]
+            if child_pairs:
+                await session.run("""
+                    UNWIND $pairs AS pair
+                    MATCH (parent:Section {node_id: pair.parent_id})
+                    MATCH (child:Section {node_id: pair.child_id})
+                    MERGE (parent)-[:HAS_SUBSECTION]->(child)
+                """, {"pairs": child_pairs})
+
+    async def get_section_tree(self, paper_id: str) -> list[dict]:
+        """Get a paper's section tree for Tree Search retrieval.
+
+        Returns a flat list of section dicts with parent_id for tree reconstruction.
+        """
+        query = """
+        MATCH (p:Paper {paper_id: $paper_id})-[:HAS_SECTION]->(root:Section)
+        OPTIONAL MATCH (root)-[:HAS_SUBSECTION*0..]->(s:Section)
+        RETURN s.node_id AS node_id,
+               s.title AS title,
+               s.heading_level AS heading_level,
+               s.summary AS summary,
+               s.section_key AS section_key,
+               s.start_page AS start_page,
+               s.end_page AS end_page
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, {"paper_id": paper_id})
+            records = await result.data()
+            return records
+
+    async def link_claim_to_section(
+        self,
+        claim_id: str,
+        section_node_id: str,
+    ) -> None:
+        """Link a claim to the section it appears in."""
+        async with self.driver.session() as session:
+            await session.run("""
+                MATCH (c:Claim {claim_id: $claim_id})
+                MATCH (s:Section {node_id: $section_node_id})
+                MERGE (s)-[:CONTAINS_CLAIM]->(c)
+            """, {"claim_id": claim_id, "section_node_id": section_node_id})
+
     async def get_claim_evidence_ledger(self, paper_id: str) -> ClaimEvidenceLedger:
         """Build a Claim-Evidence ledger for a paper."""
         query = """
