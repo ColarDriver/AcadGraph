@@ -56,6 +56,9 @@ class LLMClient:
                 messages=messages,
                 temperature=temperature if temperature is not None else self.config.temperature,
                 max_tokens=max_tokens or self.config.max_tokens,
+                extra_body={
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
             )
             content = response.choices[0].message.content or ""
             return content.strip()
@@ -78,31 +81,149 @@ class LLMClient:
 
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any]:
-        """Extract JSON from text, handling markdown code fences."""
-        # Try direct parse first
+        """Extract JSON from text, handling markdown code fences robustly."""
+        import re
+
+        if not text or not text.strip():
+            return {}
+
+        text = text.strip()
+
+        # 1. Try direct parse first
         try:
-            return json.loads(text)
+            result = json.loads(text)
+            if isinstance(result, dict):
+                return result
+            if isinstance(result, list):
+                return {"items": result}
         except json.JSONDecodeError:
             pass
 
-        # Try to find JSON in code fences
-        import re
+        # 2. Extract from markdown code fences (flexible whitespace)
+        fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+        if fence_match:
+            inner = fence_match.group(1).strip()
+            try:
+                result = json.loads(inner)
+                if isinstance(result, dict):
+                    return result
+                if isinstance(result, list):
+                    return {"items": result}
+            except json.JSONDecodeError:
+                pass
 
-        patterns = [
-            r"```json\s*\n(.*?)\n\s*```",
-            r"```\s*\n(.*?)\n\s*```",
-            r"\{.*\}",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(1) if match.lastindex else match.group(0))
-                except (json.JSONDecodeError, IndexError):
-                    continue
+        # 3. Find outermost { ... } using brace counting (handles nested objects)
+        start = text.find("{")
+        if start != -1:
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start : i + 1]
+                        try:
+                            return json.loads(candidate)
+                        except json.JSONDecodeError:
+                            break
+
+        # 4. Find outermost [ ... ] (JSON arrays)
+        start = text.find("[")
+        if start != -1:
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == "[":
+                    depth += 1
+                elif text[i] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start : i + 1]
+                        try:
+                            result = json.loads(candidate)
+                            if isinstance(result, list):
+                                return {"items": result}
+                        except json.JSONDecodeError:
+                            break
+
+        # 5. Last resort: try to repair truncated JSON
+        repaired = LLMClient._repair_truncated_json(text)
+        if repaired:
+            return repaired
 
         logger.warning("Failed to parse JSON from LLM response: %s", text[:200])
         return {}
+
+    @staticmethod
+    def _repair_truncated_json(text: str) -> dict[str, Any] | None:
+        """Attempt to repair JSON truncated by max_tokens.
+
+        Finds the first { or [, then appends missing closing brackets.
+        """
+        # Find JSON start
+        start = -1
+        start_char = ""
+        for i, ch in enumerate(text):
+            if ch == "{":
+                start = i
+                start_char = "{"
+                break
+            elif ch == "[":
+                start = i
+                start_char = "["
+                break
+
+        if start == -1:
+            return None
+
+        fragment = text[start:]
+
+        # Remove trailing incomplete string values (cut mid-string)
+        # e.g., '"description": "some text that got cut' → remove last incomplete field
+        import re
+        fragment = re.sub(r',\s*"[^"]*"\s*:\s*"[^"]*$', '', fragment)
+        fragment = re.sub(r',\s*"[^"]*$', '', fragment)
+
+        # Count unclosed brackets
+        stack = []
+        in_string = False
+        escape = False
+        for ch in fragment:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch in "{[":
+                stack.append(ch)
+            elif ch == "}" and stack and stack[-1] == "{":
+                stack.pop()
+            elif ch == "]" and stack and stack[-1] == "[":
+                stack.pop()
+
+        # Append missing closers
+        closers = ""
+        for opener in reversed(stack):
+            closers += "]" if opener == "[" else "}"
+
+        repaired = fragment + closers
+        try:
+            result = json.loads(repaired)
+            if isinstance(result, dict):
+                logger.debug("Repaired truncated JSON (added %d closers)", len(closers))
+                return result
+            if isinstance(result, list):
+                return {"items": result}
+        except json.JSONDecodeError:
+            pass
+
+        return None
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""

@@ -234,12 +234,22 @@ class ArgumentationExtractor:
 
             try:
                 result = await self._llm.complete_json(prompt, system_prompt=ZONING_SYSTEM)
-                classified = result.get("paragraphs", [])
+
+                # Support compact format {"roles": ["MOTIVATION", ...]}
+                # and legacy format {"paragraphs": [{"role": "..."}]}
+                roles_list: list[str] = []
+                if "roles" in result:
+                    roles_list = result["roles"]
+                elif "paragraphs" in result:
+                    roles_list = [
+                        p.get("role", "BACKGROUND") if isinstance(p, dict) else "BACKGROUND"
+                        for p in result["paragraphs"]
+                    ]
 
                 for i, raw_p in enumerate(raw_paragraphs):
                     role = RhetoricalRole.BACKGROUND  # default
-                    if i < len(classified):
-                        role_str = classified[i].get("role", "BACKGROUND").upper()
+                    if i < len(roles_list):
+                        role_str = str(roles_list[i]).upper()
                         role = _ROLE_MAP.get(role_str, RhetoricalRole.BACKGROUND)
 
                     paragraphs.append(ZonedParagraph(

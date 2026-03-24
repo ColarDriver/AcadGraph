@@ -190,6 +190,8 @@ def ingest(jsonl_path: str, limit: int | None, batch_size: int, skip_existing: b
     """
 
     async def _ingest():
+        import time
+
         from acadgraph.kg.incremental_builder import IncrementalKGBuilder
         from acadgraph.kg.jsonl_loader import iter_jsonl, jsonl_to_paper_source
 
@@ -218,33 +220,47 @@ def ingest(jsonl_path: str, limit: int | None, batch_size: int, skip_existing: b
             for record in iter_jsonl(jsonl_path, limit=limit, skip_ids=skip_ids):
                 papers.append(jsonl_to_paper_source(record))
 
-            console.print(f"[bold]Loaded {len(papers)} papers, processing...[/]")
+            total = len(papers)
+            console.print(f"[bold]Loaded {total} papers, processing...[/]\n")
 
-            # Parallel batch processing
-            batch_result = await builder.add_papers_batch(
-                papers, batch_size=batch_size
-            )
+            ok, fail = 0, 0
+            t0 = time.time()
 
-            # Show per-paper results
-            for r in batch_result.results:
-                if r.errors:
-                    console.print(
-                        f"[yellow]⚠ {r.errors[0][:80]}[/]"
-                    )
-                else:
-                    console.print(
-                        f"[green]✓[/] "
-                        f"({r.entities_added}E "
-                        f"{r.claims_added}C "
-                        f"{r.evidences_added}Ev "
-                        f"{r.duration_seconds:.1f}s)"
-                    )
+            # Process in batches with real-time progress
+            for batch_start in range(0, total, batch_size):
+                batch = papers[batch_start : batch_start + batch_size]
+                tasks = [builder.add_paper(p) for p in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
+                for paper, r in zip(batch, results):
+                    done = ok + fail + 1
+                    pid = paper.paper_id or paper.title[:30]
+
+                    if isinstance(r, Exception):
+                        fail += 1
+                        console.print(
+                            f"[red][{done}/{total}] ✗ {pid}: {r}[/]"
+                        )
+                    elif r.errors:
+                        fail += 1
+                        console.print(
+                            f"[yellow][{done}/{total}] ⚠ {pid}: "
+                            f"{r.errors[0][:60]}[/]"
+                        )
+                    else:
+                        ok += 1
+                        console.print(
+                            f"[green][{done}/{total}] ✓ {pid}[/] "
+                            f"({r.entities_added}E "
+                            f"{r.claims_added}C "
+                            f"{r.evidences_added}Ev "
+                            f"{r.duration_seconds:.1f}s)"
+                        )
+
+            elapsed = time.time() - t0
             console.print(
-                f"\n[bold green]Done:[/] "
-                f"{batch_result.successful}/{batch_result.total_papers} "
-                f"succeeded in {batch_result.total_duration_seconds:.1f}s, "
-                f"{batch_result.failed} errors"
+                f"\n[bold green]Done:[/] {ok}/{total} succeeded, "
+                f"{fail} errors, {elapsed:.1f}s total"
             )
 
     asyncio.run(_ingest())

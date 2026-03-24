@@ -33,7 +33,7 @@ class LLMConfig:
     api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY", "no-key"))
     model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "local-model"))
     temperature: float = 0.0
-    max_tokens: int = 4096
+    max_tokens: int = 25384
     max_concurrent: int = field(
         default_factory=lambda: int(os.getenv("MAX_CONCURRENT_LLM_CALLS", "5"))
     )

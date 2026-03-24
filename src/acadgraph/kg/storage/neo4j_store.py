@@ -663,6 +663,17 @@ class Neo4jKGStore(KgRepository):
                     ],
                 })
 
+                # ---- Paper → Claim links (batch) ----
+                await session.run("""
+                    UNWIND $claim_ids AS cid
+                    MATCH (p:Paper {paper_id: $paper_id})
+                    MATCH (cl:Claim {claim_id: cid})
+                    MERGE (p)-[:MAKES_CLAIM]->(cl)
+                """, {
+                    "paper_id": paper_id,
+                    "claim_ids": [c.claim_id for c in arg.claims],
+                })
+
             # ---- CoreIdea → Claim links (precise mapping or fallback cartesian) ----
             if arg.core_ideas and arg.claims:
                 idea_claim_map = getattr(arg, "_idea_claim_map", {})
