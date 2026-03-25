@@ -57,6 +57,8 @@ class QdrantKGStore(VectorIndex):
             port=self.config.port,
         )
         logger.info("Connected to Qdrant at %s:%d", self.config.host, self.config.port)
+        # Auto-create collections if they don't exist
+        await self.init_collections()
 
     async def close(self) -> None:
         """Close Qdrant connection."""

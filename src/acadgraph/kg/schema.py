@@ -146,7 +146,9 @@ class Entity:
 
     def __post_init__(self):
         if not self.entity_id:
-            self.entity_id = generate_id(self.entity_type.value.lower())
+            # Deterministic ID: same name + type → same entity_id → MERGE dedup
+            canonical = f"{self.entity_type.value.lower()}:{self.name.strip().lower()}"
+            self.entity_id = f"{self.entity_type.value.lower()}_{hash_text(canonical)}"
 
 
 class RelationType(str, Enum):
@@ -202,6 +204,7 @@ class CitationEdge:
     """A citation relationship with intent."""
     citing_paper_id: str = ""
     cited_paper_id: str = ""
+    cited_title: str = ""  # Title of the cited work
     intent: CitationIntent = CitationIntent.CITES_AS_COMPARISON
     context: str = ""  # The sentence(s) around the citation
     section: str = ""  # Which section the citation occurs in

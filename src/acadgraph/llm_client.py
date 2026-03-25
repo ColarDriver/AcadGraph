@@ -93,6 +93,11 @@ class LLMClient:
 
         text = text.strip()
 
+        # 0. Strip markdown code fences (including unclosed ones from truncation)
+        text = re.sub(r'^```(?:json)?\s*\n?', '', text)
+        text = re.sub(r'\n?```\s*$', '', text)
+        text = text.strip()
+
         # 1. Try direct parse first
         try:
             result = json.loads(text)
@@ -182,11 +187,16 @@ class LLMClient:
 
         fragment = text[start:]
 
-        # Remove trailing incomplete string values (cut mid-string)
-        # e.g., '"description": "some text that got cut' → remove last incomplete field
+        # Remove trailing incomplete values (cut mid-string, mid-number, mid-bool)
         import re
+        # Remove trailing incomplete string: ,"key": "incomplete text
         fragment = re.sub(r',\s*"[^"]*"\s*:\s*"[^"]*$', '', fragment)
+        # Remove trailing incomplete number: ,"key": 20
+        fragment = re.sub(r',\s*"[^"]*"\s*:\s*\d*$', '', fragment)
+        # Remove trailing incomplete key
         fragment = re.sub(r',\s*"[^"]*$', '', fragment)
+        # Remove trailing incomplete object/array start
+        fragment = re.sub(r',\s*$', '', fragment)
 
         # Count unclosed brackets
         stack = []

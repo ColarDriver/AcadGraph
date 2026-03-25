@@ -310,7 +310,7 @@ class Neo4jKGStore(KgRepository):
                 "section": edge.section,
                 "confidence": edge.confidence,
                 "citing_title": edge.citing_paper_id,
-                "cited_title": edge.cited_paper_id,
+                "cited_title": edge.cited_title or edge.cited_paper_id,
             })
             record = await result.single()
             return bool(record and record.get("linked", 0) > 0)

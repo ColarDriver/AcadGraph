@@ -21,6 +21,7 @@ from acadgraph.kg.schema import (
     ParsedPaper,
     Reference,
     generate_id,
+    hash_text,
 )
 from acadgraph.llm_client import LLMClient
 
@@ -31,6 +32,7 @@ SYSTEM_PROMPT = load_prompt("citation", "citation_system")
 CITATION_CLASSIFICATION_PROMPT = load_prompt("citation", "citation_classification")
 BATCH_CITATION_PROMPT = load_prompt("citation", "citation_batch")
 EVOLUTION_DETECTION_PROMPT = load_prompt("citation", "evolution_detection")
+LLM_CITATION_EXTRACT_PROMPT = load_prompt("citation", "citation_llm_extract")
 
 # Map string intents to enum
 _INTENT_MAP: dict[str, CitationIntent] = {
@@ -82,136 +84,76 @@ class CitationEvolutionBuilder:
 
     async def classify_citations(self, parsed_paper: ParsedPaper) -> list[CitationEdge]:
         """
-        Classify all citations in a paper by intent.
+        Extract and classify citations using LLM.
 
-        Steps:
-        1. Extract citation contexts from each section
-        2. Batch-classify citation intents using LLM
-        3. Generate typed citation edges
+        Instead of regex-based citation matching (which fails on OCR text),
+        the LLM directly reads paper sections and extracts cited works.
         """
-        # Step 1: Extract citation contexts per section
-        citation_contexts = self._extract_citation_contexts(parsed_paper)
+        # Build sections text for the LLM (focus on citation-heavy sections)
+        citation_sections = ["introduction", "related_work", "method", "experiments"]
+        sections_text_parts = []
+        total_chars = 0
+        max_chars = 6000  # Stay within token limits
 
-        if not citation_contexts:
-            logger.info("No citations found in paper %s", parsed_paper.paper_id)
+        for sec_name in citation_sections:
+            sec_text = parsed_paper.sections.get(sec_name, "")
+            if not sec_text:
+                continue
+            remaining = max_chars - total_chars
+            if remaining <= 0:
+                break
+            truncated = sec_text[:remaining]
+            sections_text_parts.append(f"### {sec_name}\n{truncated}")
+            total_chars += len(truncated)
+
+        if not sections_text_parts:
+            logger.info("No citation-relevant sections in paper %s", parsed_paper.paper_id)
             return []
 
-        # Step 2: Batch classify
-        edges: list[CitationEdge] = []
+        sections_text = "\n\n".join(sections_text_parts)
 
-        # Process in batches of ~10 citations per LLM call
-        batch_size = 10
-        for i in range(0, len(citation_contexts), batch_size):
-            batch = citation_contexts[i : i + batch_size]
-            batch_edges = await self._classify_batch(batch, parsed_paper.paper_id)
-            edges.extend(batch_edges)
-
-        logger.info(
-            "Classified %d citations for paper %s",
-            len(edges), parsed_paper.paper_id,
-        )
-        return edges
-
-    def _extract_citation_contexts(
-        self, parsed_paper: ParsedPaper
-    ) -> list[dict[str, Any]]:
-        """Extract citation contexts from all sections."""
-        contexts: list[dict[str, Any]] = []
-
-        # Citation patterns: [1], [1,2], (Author et al., 2023), Author et al. (2023)
-        citation_pattern = re.compile(
-            r"(?:\[(\d+(?:,\s*\d+)*)\])"  # Numbered: [1], [1,2,3]
-            r"|(?:\(([A-Z][a-zA-Z]+(?:\s+et\s+al\.?)?,?\s*\d{4}(?:;\s*[A-Z][a-zA-Z]+(?:\s+et\s+al\.?)?,?\s*\d{4})*)\))"  # Author (Year)
-        )
-
-        for section_name, section_text in parsed_paper.sections.items():
-            if not section_text:
-                continue
-
-            sentences = self._split_sentences(section_text)
-            for sentence in sentences:
-                matches = citation_pattern.finditer(sentence)
-                for match in matches:
-                    ref_key = match.group(0)
-                    # Find the referenced paper info
-                    ref_info = self._find_reference(ref_key, parsed_paper.references)
-
-                    contexts.append({
-                        "ref_key": ref_key,
-                        "section": section_name,
-                        "context": sentence.strip(),
-                        "cited_title": ref_info.title if ref_info else "",
-                        "cited_year": ref_info.year if ref_info else None,
-                    })
-
-        return contexts
-
-    async def _classify_batch(
-        self, batch: list[dict[str, Any]], citing_paper_id: str
-    ) -> list[CitationEdge]:
-        """Classify a batch of citation contexts using LLM."""
-        edges: list[CitationEdge] = []
-
-        # Format citations for the batch prompt
-        citations_for_prompt = []
-        for ctx in batch:
-            citations_for_prompt.append({
-                "ref_key": ctx["ref_key"],
-                "section": ctx["section"],
-                "context": ctx["context"][:300],  # Truncate long contexts
-                "cited_title": ctx.get("cited_title", ""),
-            })
-
+        # Use LLM to extract citations
         prompt = render_prompt(
-            BATCH_CITATION_PROMPT,
-            citations_json=json.dumps(citations_for_prompt, indent=2, ensure_ascii=False)
+            LLM_CITATION_EXTRACT_PROMPT,
+            sections_text=sections_text,
         )
+
+        edges: list[CitationEdge] = []
 
         try:
             result = await self._llm.complete_json(prompt, system_prompt=SYSTEM_PROMPT)
-            classifications = result.get("classifications", [])
+            citations = result.get("citations", [])
 
-            for i, cls in enumerate(classifications):
-                if i >= len(batch):
-                    break
-
-                intent_str = cls.get("intent", "CITES_AS_COMPARISON").upper()
-                intent = _INTENT_MAP.get(intent_str, CitationIntent.CITES_AS_COMPARISON)
-                confidence = float(cls.get("confidence", 0.7))
-
-                # Generate a cited_paper_id from ref_key or title
-                cited_id = batch[i].get("cited_title", batch[i]["ref_key"])
-
-                if not _is_valid_cited_id(cited_id):
-                    logger.debug("Skipping invalid cited_id: %r", cited_id)
+            for cit in citations:
+                cited_title = cit.get("cited_title", "")
+                if not cited_title or not _is_valid_cited_id(cited_title):
                     continue
 
+                intent_str = cit.get("intent", "CITES_AS_COMPARISON").upper()
+                intent = _INTENT_MAP.get(intent_str, CitationIntent.CITES_AS_COMPARISON)
+                section = cit.get("section", "unknown")
+                context = cit.get("context", "")[:300]
+
+                # Deterministic cited_paper_id from title hash (enables cross-paper dedup)
+                cited_paper_id = f"cited_{hash_text(cited_title)}"
+
                 edges.append(CitationEdge(
-                    citing_paper_id=citing_paper_id,
-                    cited_paper_id=cited_id,
+                    citing_paper_id=parsed_paper.paper_id,
+                    cited_paper_id=cited_paper_id,
+                    cited_title=cited_title,
                     intent=intent,
-                    context=batch[i]["context"],
-                    section=batch[i]["section"],
-                    confidence=confidence,
+                    context=context,
+                    section=section,
+                    confidence=0.8,
                 ))
+
+            logger.info(
+                "Extracted %d citations for paper %s (LLM-based)",
+                len(edges), parsed_paper.paper_id,
+            )
 
         except Exception as e:
-            logger.warning("Batch citation classification failed: %s", e)
-            # Fallback: use section-based heuristic
-            for ctx in batch:
-                section = ctx["section"]
-                cited_id = ctx.get("cited_title", ctx["ref_key"])
-                if not _is_valid_cited_id(cited_id):
-                    continue
-                intent = _SECTION_INTENT_PRIOR.get(section, CitationIntent.CITES_AS_COMPARISON)
-                edges.append(CitationEdge(
-                    citing_paper_id=citing_paper_id,
-                    cited_paper_id=cited_id,
-                    intent=intent,
-                    context=ctx["context"],
-                    section=section,
-                    confidence=0.5,
-                ))
+            logger.warning("LLM citation extraction failed for %s: %s", parsed_paper.paper_id, e)
 
         return edges
 

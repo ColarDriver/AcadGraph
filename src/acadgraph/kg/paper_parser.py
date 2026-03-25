@@ -533,22 +533,39 @@ class PaperParser:
 
         ref_text = ref_section_match.group(1)
 
-        # Parse individual references (numbered or bulleted)
-        ref_entries = re.split(r"\n(?:\[\d+\]|\d+\.)\s+", ref_text)
+        # Parse individual references:
+        # Format 1: numbered [1] or 1.
+        # Format 2: markdown list "- Author..."
+        ref_entries = re.split(r"\n(?:\[\d+\]|\d+\.|-)\s+", ref_text)
         for i, entry in enumerate(ref_entries):
-            entry = entry.strip()
+            # Strip HTML span tags
+            entry = re.sub(r"<span[^>]*>|</span>", "", entry).strip()
             if not entry or len(entry) < 10:
                 continue
 
             ref = Reference(ref_key=f"[{i + 1}]")
-            # Try to extract title (usually in quotes or after authors)
+            # Try to extract title (in quotes, italics, or after first period)
             title_match = re.search(r'["""](.+?)["""]', entry)
+            if not title_match:
+                # Try italic markdown: *Title*
+                title_match = re.search(r'\*(.+?)\*', entry)
+            if not title_match:
+                # Try text after first period (Author list. Title. Venue)
+                parts = entry.split('. ', 2)
+                if len(parts) >= 2:
+                    ref.title = parts[1].strip().rstrip('.')
             if title_match:
                 ref.title = title_match.group(1)
+
             # Try to extract year
             year_match = re.search(r"\b((?:19|20)\d{2})\b", entry)
             if year_match:
                 ref.year = int(year_match.group(1))
+
+            # Extract authors (first part before the first period)
+            author_part = entry.split('.')[0].strip()
+            if author_part:
+                ref.authors = [a.strip() for a in author_part.split(',') if a.strip()]
 
             references.append(ref)
 
