@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -56,11 +57,10 @@ class LLMClient:
                 messages=messages,
                 temperature=temperature if temperature is not None else self.config.temperature,
                 max_tokens=max_tokens or self.config.max_tokens,
-                extra_body={
-                    "chat_template_kwargs": {"enable_thinking": False},
-                },
             )
             content = response.choices[0].message.content or ""
+            # Strip any <think>...</think> blocks from Qwen3 thinking mode
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
             return content.strip()
 
     async def complete_json(

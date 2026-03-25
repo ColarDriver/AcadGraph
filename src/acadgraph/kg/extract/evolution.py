@@ -50,6 +50,29 @@ _SECTION_INTENT_PRIOR: dict[str, CitationIntent] = {
     "experiments": CitationIntent.CITES_AS_BASELINE,
 }
 
+# Minimum length and pattern for a valid cited paper ID
+_MIN_CITED_ID_LEN = 5
+
+
+def _is_valid_cited_id(cited_id: str) -> bool:
+    """Check if a cited paper ID looks like a real paper reference.
+
+    Rejects: empty strings, single words, short fragments, purely numeric.
+    Accepts: paper IDs (alphanumeric hashes >=8 chars), full titles (>=5 chars with spaces).
+    """
+    if not cited_id or not cited_id.strip():
+        return False
+    cited_id = cited_id.strip()
+    if len(cited_id) < _MIN_CITED_ID_LEN:
+        return False
+    # Must contain at least one letter
+    if not any(c.isalpha() for c in cited_id):
+        return False
+    # Single word without spaces is suspicious unless it's a hash-like ID (>=8 chars)
+    if ' ' not in cited_id and len(cited_id) < 8:
+        return False
+    return True
+
 
 class CitationEvolutionBuilder:
     """Citation relation + technology evolution chain builder."""
@@ -159,6 +182,10 @@ class CitationEvolutionBuilder:
                 # Generate a cited_paper_id from ref_key or title
                 cited_id = batch[i].get("cited_title", batch[i]["ref_key"])
 
+                if not _is_valid_cited_id(cited_id):
+                    logger.debug("Skipping invalid cited_id: %r", cited_id)
+                    continue
+
                 edges.append(CitationEdge(
                     citing_paper_id=citing_paper_id,
                     cited_paper_id=cited_id,
@@ -173,10 +200,13 @@ class CitationEvolutionBuilder:
             # Fallback: use section-based heuristic
             for ctx in batch:
                 section = ctx["section"]
+                cited_id = ctx.get("cited_title", ctx["ref_key"])
+                if not _is_valid_cited_id(cited_id):
+                    continue
                 intent = _SECTION_INTENT_PRIOR.get(section, CitationIntent.CITES_AS_COMPARISON)
                 edges.append(CitationEdge(
                     citing_paper_id=citing_paper_id,
-                    cited_paper_id=ctx.get("cited_title", ctx["ref_key"]),
+                    cited_paper_id=cited_id,
                     intent=intent,
                     context=ctx["context"],
                     section=section,

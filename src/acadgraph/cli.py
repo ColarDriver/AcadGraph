@@ -226,36 +226,48 @@ def ingest(jsonl_path: str, limit: int | None, batch_size: int, skip_existing: b
             ok, fail = 0, 0
             t0 = time.time()
 
-            # Process in batches with real-time progress
-            for batch_start in range(0, total, batch_size):
-                batch = papers[batch_start : batch_start + batch_size]
-                tasks = [builder.add_paper(p) for p in batch]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Sliding window: always keep `batch_size` papers in flight
+            sem = asyncio.Semaphore(batch_size)
+            lock = asyncio.Lock()
 
-                for paper, r in zip(batch, results):
-                    done = ok + fail + 1
+            async def _process_one(paper, idx):
+                nonlocal ok, fail
+                async with sem:
                     pid = paper.paper_id or paper.title[:30]
+                    try:
+                        r = await builder.add_paper(paper)
+                        async with lock:
+                            if r.errors:
+                                fail += 1
+                                done = ok + fail
+                                console.print(
+                                    f"[yellow][{done}/{total}] ⚠ {pid}: "
+                                    f"{r.errors[0][:60]}[/]"
+                                )
+                            else:
+                                ok += 1
+                                done = ok + fail
+                                console.print(
+                                    f"[green][{done}/{total}] ✓ {pid}[/] "
+                                    f"({r.entities_added}E "
+                                    f"{r.claims_added}C "
+                                    f"{r.evidences_added}Ev "
+                                    f"{r.duration_seconds:.1f}s)"
+                                )
+                    except Exception as e:
+                        async with lock:
+                            fail += 1
+                            done = ok + fail
+                            console.print(
+                                f"[red][{done}/{total}] ✗ {pid}: {e}[/]"
+                            )
 
-                    if isinstance(r, Exception):
-                        fail += 1
-                        console.print(
-                            f"[red][{done}/{total}] ✗ {pid}: {r}[/]"
-                        )
-                    elif r.errors:
-                        fail += 1
-                        console.print(
-                            f"[yellow][{done}/{total}] ⚠ {pid}: "
-                            f"{r.errors[0][:60]}[/]"
-                        )
-                    else:
-                        ok += 1
-                        console.print(
-                            f"[green][{done}/{total}] ✓ {pid}[/] "
-                            f"({r.entities_added}E "
-                            f"{r.claims_added}C "
-                            f"{r.evidences_added}Ev "
-                            f"{r.duration_seconds:.1f}s)"
-                        )
+            # Launch all tasks; semaphore controls concurrency
+            tasks = [
+                asyncio.create_task(_process_one(p, i))
+                for i, p in enumerate(papers)
+            ]
+            await asyncio.gather(*tasks)
 
             elapsed = time.time() - t0
             console.print(

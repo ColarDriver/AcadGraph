@@ -80,9 +80,12 @@ def iter_jsonl(
 
 def _parse_record(obj: dict) -> JournalRecord:
     """Parse a raw JSON dict into a JournalRecord."""
-    # Parse authors: "Alice, Bob, Charlie" -> ["Alice", "Bob", "Charlie"]
+    # Parse authors: may be "Alice, Bob" (str) or ["Alice", "Bob"] (list)
     authors_raw = obj.get("authors", "")
-    authors = [a.strip() for a in authors_raw.split(",") if a.strip()]
+    if isinstance(authors_raw, list):
+        authors = [str(a).strip() for a in authors_raw if a]
+    else:
+        authors = [a.strip() for a in str(authors_raw).split(",") if a.strip()]
 
     # Parse year
     year_raw = obj.get("year", "")
@@ -100,8 +103,9 @@ def _parse_record(obj: dict) -> JournalRecord:
         except (json.JSONDecodeError, TypeError):
             logger.debug("Failed to parse content_meta for %s", obj.get("id", "?"))
 
-    # Clean content
-    content = _clean_markdown(obj.get("content", ""))
+    # Clean content — support both 'content' (format A) and 'context' (format B)
+    raw_content = obj.get("content", "") or obj.get("context", "")
+    content = _clean_markdown(raw_content)
 
     return JournalRecord(
         id=obj.get("id", ""),
