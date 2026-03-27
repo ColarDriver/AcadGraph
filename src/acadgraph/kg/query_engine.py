@@ -26,9 +26,12 @@ from acadgraph.kg.ontology import (
 )
 from acadgraph.kg.schema import (
     ClaimEvidenceLedger,
+    ComponentEvidence,
     CompetitionSpace,
+    CrossDomainBridge,
     EvolutionTimeline,
     GapStatement,
+    InnovationPath,
     NoveltyMap,
 )
 from acadgraph.llm_client import LLMClient
@@ -858,3 +861,359 @@ Return JSON:
             "neo4j": neo4j_stats,
             "qdrant": qdrant_stats,
         }
+
+    # ========================================================================
+    # Innovation Path Mining
+    # ========================================================================
+
+    async def find_innovation_paths(
+        self,
+        idea: str,
+        method_names: list[str],
+        k: int = 20,
+    ) -> InnovationPath:
+        """Find cross-method innovation paths: Method→Gap→CoreIdea.
+
+        1. Query graph for Gaps/Problems associated with the given methods
+        2. Find existing CoreIdeas that address those gaps
+        3. Find unsupported (open) gaps
+        4. Semantically search for similar CoreIdeas via Qdrant
+        5. LLM synthesizes a combination innovation suggestion
+        """
+        # Step 1: Get gaps for methods
+        gaps = await self.neo4j.find_gaps_for_methods(method_names)
+
+        # Step 2: Find addressing ideas for discovered gaps
+        gap_ids = list({g.get("gap_id", "") for g in gaps if g.get("gap_id")})
+        addressing_ideas = await self.neo4j.find_addressing_ideas(gap_ids)
+
+        # Step 3: Find unaddressed gaps
+        unaddressed = await self.neo4j.find_unsupported_gaps(method_names)
+
+        # Step 4: Semantic search for similar CoreIdeas
+        idea_embedding = await self.embedding.embed(idea)
+        semantic_hits = await self.qdrant.search_similar(
+            CLAIM_COLLECTION, idea_embedding, k=k,
+            filters={"doc_kind": DOC_KIND_CLAIM},
+        )
+        semantic_ideas = [
+            {
+                "paper_id": h["payload"].get("paper_id", ""),
+                "claim_type": h["payload"].get("claim_type", ""),
+                "score": h["score"],
+            }
+            for h in semantic_hits
+        ]
+
+        # Step 5: Get evidence support for method components
+        evidence_data = await self.neo4j.get_component_evidence(method_names)
+
+        # Step 6: LLM synthesis
+        prompt = f"""You are analyzing a research innovation opportunity.
+
+## Research Idea
+{idea}
+
+## Methods Being Combined
+{json.dumps(method_names)}
+
+## Known Gaps for These Methods (from Knowledge Graph)
+{json.dumps(gaps[:15], indent=2, ensure_ascii=False, default=str)}
+
+## Existing Solutions (CoreIdeas addressing these gaps)
+{json.dumps(addressing_ideas[:10], indent=2, ensure_ascii=False, default=str)}
+
+## Open Gaps (no existing solution found)
+{json.dumps(unaddressed[:10], indent=2, ensure_ascii=False, default=str)}
+
+## Semantically Similar Claims
+{json.dumps(semantic_ideas[:10], indent=2, ensure_ascii=False, default=str)}
+
+## Task
+Based on the knowledge graph data above, suggest a concrete combination 
+innovation path. Explain:
+1. Which gaps can be filled by combining these methods
+2. What novel mechanism the combination enables
+3. What remains unexplored
+
+Return JSON:
+```json
+{{
+  "suggested_combination": "2-3 sentence description of the innovation path",
+  "filled_gaps": ["gap descriptions that the combination addresses"],
+  "novel_mechanism": "what new mechanism this enables",
+  "remaining_challenges": ["what still needs to be solved"]
+}}
+```
+"""
+        suggested = ""
+        try:
+            result = await self.llm.complete_json(prompt)
+            suggested = result.get("suggested_combination", "")
+        except Exception as e:
+            logger.error("Innovation path LLM synthesis failed: %s", e)
+
+        return InnovationPath(
+            source_methods=method_names,
+            gaps=gaps,
+            addressing_ideas=addressing_ideas,
+            unaddressed_gaps=unaddressed,
+            suggested_combination=suggested,
+            evidence_support=evidence_data,
+        )
+
+    async def find_cross_domain_bridges(
+        self,
+        method_a: str,
+        method_b: str,
+        method_a_variants: list[str] | None = None,
+        method_b_variants: list[str] | None = None,
+    ) -> CrossDomainBridge:
+        """Find cross-domain bridges between two method families.
+
+        Discovers shared concepts, tasks, datasets, and papers that bridge
+        two method domains.
+        """
+        a_names = [method_a] + (method_a_variants or [])
+        b_names = [method_b] + (method_b_variants or [])
+
+        # Find shared concepts between method groups
+        shared = await self.neo4j.find_cross_domain_bridges(a_names, b_names)
+
+        # Find bridge papers that reference both domains
+        bridge_papers = await self.neo4j.find_bridge_papers(a_names, b_names)
+
+        # LLM evaluate combination novelty
+        novelty = ""
+        if shared or bridge_papers:
+            prompt = f"""Evaluate the novelty of combining these two method families:
+
+## Method Family A: {method_a}
+Variants: {a_names}
+
+## Method Family B: {method_b}
+Variants: {b_names}
+
+## Shared Concepts/Entities Found in Knowledge Graph
+{json.dumps(shared[:15], indent=2, ensure_ascii=False, default=str)}
+
+## Bridge Papers (referencing both domains)
+{json.dumps(bridge_papers[:10], indent=2, ensure_ascii=False, default=str)}
+
+## Task
+Assess the combination novelty. Consider:
+- How many bridge papers already exist? (many = less novel)
+- What shared concepts could serve as integration points?
+- What would be genuinely new about this combination?
+
+Return a JSON object:
+```json
+{{
+  "novelty_assessment": "1-2 sentences on combination novelty",
+  "integration_points": ["concept1", "concept2"],
+  "novelty_score": 0.0-1.0
+}}
+```
+"""
+            try:
+                result = await self.llm.complete_json(prompt)
+                novelty = result.get("novelty_assessment", "")
+            except Exception as e:
+                logger.error("Bridge novelty assessment failed: %s", e)
+
+        return CrossDomainBridge(
+            method_a=method_a,
+            method_b=method_b,
+            shared_concepts=shared,
+            bridge_papers=bridge_papers,
+            combination_novelty=novelty,
+        )
+
+    async def gap_grounded_statement(
+        self,
+        idea: str,
+        method_names: list[str],
+    ) -> GapStatement:
+        """Generate a graph-grounded gap statement.
+
+        Unlike generate_gap_statement (which relies purely on LLM),
+        this method first queries the KG for existing Problem/Gap/CoreIdea
+        nodes associated with the methods, then uses that data as grounded
+        context for the LLM to generate a falsifiable gap statement.
+        """
+        # Query graph for existing gaps
+        gaps = await self.neo4j.find_gaps_for_methods(method_names)
+        unaddressed = await self.neo4j.find_unsupported_gaps(method_names)
+
+        # Semantic search for relevant evidence
+        idea_embedding = await self.embedding.embed(idea)
+        evidence_hits = await self.qdrant.search_similar(
+            CLAIM_COLLECTION, idea_embedding, k=10,
+            filters={"doc_kind": DOC_KIND_EVIDENCE},
+        )
+        evidence_context = [
+            {
+                "paper_id": h["payload"].get("paper_id", ""),
+                "score": h["score"],
+            }
+            for h in evidence_hits[:5]
+        ]
+
+        context = f"""
+## Graph-Grounded Context (from KG with {len(gaps)} gaps found)
+
+### Known Problems and Gaps for Methods: {method_names}
+{json.dumps(gaps[:10], indent=2, ensure_ascii=False, default=str)}
+
+### Open/Unresolved Gaps (no existing CoreIdea addresses these)
+{json.dumps(unaddressed[:10], indent=2, ensure_ascii=False, default=str)}
+
+### Most Relevant Evidence from Other Papers
+{json.dumps(evidence_context, indent=2, ensure_ascii=False, default=str)}
+"""
+
+        prompt = f"""Generate a rigorous, falsifiable gap statement for this research idea,
+grounded in the knowledge graph evidence provided below.
+
+## Research Idea:
+{idea}
+{context}
+
+## Gap Statement Template:
+"Existing methods can solve [Problem P] under [Setting S],
+ but still fail under [Constraint F],
+ because they lack [Mechanism M];
+ according to our retrieval, no existing method simultaneously satisfies [A, B, C]."
+
+IMPORTANT: Base your gap statement on the ACTUAL gaps and problems found in the
+knowledge graph above, not on hypothetical ones.
+
+Return JSON:
+```json
+{{
+  "statement": "full gap statement grounded in KG data",
+  "problem": "the problem P (from graph data)",
+  "setting": "the setting S",
+  "failure_constraint": "the constraint/failure mode F (from graph gaps)",
+  "missing_mechanism": "the mechanism M they lack",
+  "novelty_checklist": ["A", "B", "C"],
+  "supporting_evidence": ["evidence from the KG supporting this gap"]
+}}
+```
+"""
+
+        try:
+            result = await self.llm.complete_json(prompt)
+            return GapStatement(
+                statement=result.get("statement", ""),
+                problem=result.get("problem", ""),
+                setting=result.get("setting", ""),
+                failure_constraint=result.get("failure_constraint", ""),
+                missing_mechanism=result.get("missing_mechanism", ""),
+                novelty_checklist=result.get("novelty_checklist", []),
+                supporting_evidence=result.get("supporting_evidence", []),
+            )
+        except Exception as e:
+            logger.error("Grounded gap statement failed: %s", e)
+            return GapStatement()
+
+    async def analyze_method_convergence(
+        self,
+        method_names: list[str],
+    ) -> dict[str, Any]:
+        """Analyze convergence/divergence of multiple methods' evolution chains.
+
+        Finds cross-method evolution intersections and shared ancestors.
+        """
+        evolution_data: dict[str, list[dict]] = {}
+        for method in method_names:
+            timeline = await self.get_method_evolution(method)
+            evolution_data[method] = [
+                {"step": s.step_description, "year": s.year, "paper_id": s.paper_id}
+                for s in timeline.steps
+            ]
+
+        # Find shared entities across evolution chains via Qdrant
+        all_paper_ids: set[str] = set()
+        for steps in evolution_data.values():
+            for step in steps:
+                pid = step.get("paper_id", "")
+                if pid:
+                    all_paper_ids.add(pid)
+
+        # Find shared entities between methods' papers
+        shared_entities = await self.neo4j.find_cross_domain_bridges(
+            method_names[:len(method_names)//2] or method_names[:1],
+            method_names[len(method_names)//2:] or method_names[1:],
+        ) if len(method_names) >= 2 else []
+
+        return {
+            "methods": method_names,
+            "evolution_chains": evolution_data,
+            "shared_entities": shared_entities,
+            "convergence_points": [
+                e for e in shared_entities
+                if e.get("papers_a_count", 0) >= 2
+            ],
+        }
+
+    async def analyze_component_evidence(
+        self,
+        method_names: list[str],
+    ) -> list[ComponentEvidence]:
+        """Analyze evidence strength for each method component."""
+        raw_data = await self.neo4j.get_component_evidence(method_names)
+
+        # Aggregate by method
+        method_stats: dict[str, dict[str, Any]] = {}
+        for row in raw_data:
+            method = row.get("method", "")
+            if method not in method_stats:
+                method_stats[method] = {
+                    "papers": set(),
+                    "claims": 0,
+                    "evidences": 0,
+                    "strengths": [],
+                    "unsupported": [],
+                }
+            stats = method_stats[method]
+            pid = row.get("paper_id", "")
+            if pid:
+                stats["papers"].add(pid)
+            stats["claims"] += row.get("claim_count", 0)
+            stats["evidences"] += row.get("evidence_count", 0)
+
+            strengths = row.get("strengths", [])
+            stats["strengths"].extend(s for s in strengths if s)
+
+            for detail in row.get("claim_details", []):
+                if isinstance(detail, dict) and not detail.get("has_evidence", True):
+                    if detail.get("severity") in ("P0", "P1"):
+                        stats["unsupported"].append({
+                            "claim_id": detail.get("claim_id", ""),
+                            "text": detail.get("text", ""),
+                            "severity": detail.get("severity", ""),
+                        })
+
+        # Compute average support strength
+        STRENGTH_MAP = {"FULL": 1.0, "PARTIAL": 0.5, "WEAK": 0.25, "NONE": 0.0}
+
+        results = []
+        for method, stats in method_stats.items():
+            strengths = stats["strengths"]
+            avg = 0.0
+            if strengths:
+                numeric = [STRENGTH_MAP.get(str(s).upper(), 0.0) for s in strengths]
+                avg = sum(numeric) / len(numeric) if numeric else 0.0
+
+            results.append(ComponentEvidence(
+                method_name=method,
+                paper_count=len(stats["papers"]),
+                claim_count=stats["claims"],
+                evidence_count=stats["evidences"],
+                avg_support_strength=round(avg, 3),
+                unsupported_claims=stats["unsupported"][:10],
+            ))
+
+        return results
+

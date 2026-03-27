@@ -1165,3 +1165,156 @@ class Neo4jKGStore(KgRepository):
             if not record:
                 return {}
             return dict(record)
+
+    # ========================================================================
+    # Innovation Path Mining Queries
+    # ========================================================================
+
+    async def find_gaps_for_methods(
+        self, method_names: list[str]
+    ) -> list[dict[str, Any]]:
+        """Find Gap/Problem nodes associated with given methods."""
+        if not method_names:
+            return []
+        query = """
+        MATCH (m:Method)
+        WHERE toLower(m.name) IN $method_names
+        MATCH (p:Paper)-[:PROPOSES|INTRODUCES]->(m)
+        MATCH (p)-[:HAS_PROBLEM]->(prob:Problem)-[:HAS_GAP]->(g:Gap)
+        RETURN DISTINCT m.name AS method, prob.description AS problem,
+               prob.problem_id AS problem_id,
+               g.failure_mode AS failure_mode, g.constraint AS constraint,
+               g.gap_id AS gap_id, p.paper_id AS paper_id, p.title AS title
+        ORDER BY m.name
+        """
+        normalized = [n.strip().lower() for n in method_names]
+        async with self.driver.session() as session:
+            result = await session.run(query, {"method_names": normalized})
+            return await result.data()
+
+    async def find_addressing_ideas(
+        self, gap_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Find CoreIdeas that address given Gaps."""
+        if not gap_ids:
+            return []
+        query = """
+        MATCH (g:Gap)-[:ADDRESSED_BY]->(ci:CoreIdea)
+        WHERE g.gap_id IN $gap_ids
+        OPTIONAL MATCH (ci)<-[:MAKES_CLAIM]-(cl:Claim)
+        RETURN g.gap_id AS gap_id, ci.idea_id AS idea_id,
+               ci.mechanism AS mechanism,
+               ci.novelty_type AS novelty_type,
+               ci.key_innovation AS key_innovation,
+               ci.source_paper_id AS paper_id,
+               count(DISTINCT cl) AS claim_count
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, {"gap_ids": gap_ids})
+            return await result.data()
+
+    async def find_cross_domain_bridges(
+        self, method_a_names: list[str], method_b_names: list[str]
+    ) -> list[dict[str, Any]]:
+        """Find shared concepts/tasks/datasets between two method groups."""
+        if not method_a_names or not method_b_names:
+            return []
+        # Optimized: match both sides to shared node independently,
+        # then aggregate — avoids O(n²) any() list predicate.
+        query = """
+        MATCH (m1:Method)<-[:PROPOSES|INTRODUCES]-(p1:Paper)
+              -[:PROPOSES|INTRODUCES|USES]->(shared)
+        WHERE toLower(m1.name) IN $method_a
+        WITH shared, collect(DISTINCT p1) AS pA
+        MATCH (m2:Method)<-[:PROPOSES|INTRODUCES]-(p2:Paper)
+              -[:PROPOSES|INTRODUCES|USES]->(shared)
+        WHERE toLower(m2.name) IN $method_b
+        RETURN labels(shared)[0] AS entity_type, shared.name AS name,
+               size(pA) AS papers_a_count,
+               count(DISTINCT p2) AS papers_b_count
+        ORDER BY papers_a_count + count(DISTINCT p2) DESC
+        LIMIT 30
+        """
+        norm_a = [n.strip().lower() for n in method_a_names]
+        norm_b = [n.strip().lower() for n in method_b_names]
+        async with self.driver.session() as session:
+            result = await session.run(query, {"method_a": norm_a, "method_b": norm_b})
+            return await result.data()
+
+    async def find_unsupported_gaps(
+        self, method_names: list[str]
+    ) -> list[dict[str, Any]]:
+        """Find Gaps that have no ADDRESSED_BY CoreIdea for given methods."""
+        if not method_names:
+            return []
+        query = """
+        MATCH (m:Method)<-[:PROPOSES|INTRODUCES]-(p:Paper)
+        WHERE toLower(m.name) IN $method_names
+        MATCH (p)-[:HAS_PROBLEM]->(prob:Problem)-[:HAS_GAP]->(g:Gap)
+        WHERE NOT (g)-[:ADDRESSED_BY]->(:CoreIdea)
+        RETURN DISTINCT g.gap_id AS gap_id, g.failure_mode AS failure_mode,
+               g.constraint AS constraint, prob.description AS problem,
+               prob.problem_id AS problem_id,
+               p.paper_id AS paper_id, p.title AS title
+        """
+        normalized = [n.strip().lower() for n in method_names]
+        async with self.driver.session() as session:
+            result = await session.run(query, {"method_names": normalized})
+            return await result.data()
+
+    async def get_component_evidence(
+        self, method_names: list[str]
+    ) -> list[dict[str, Any]]:
+        """Get evidence strength breakdown per method component."""
+        if not method_names:
+            return []
+        query = """
+        MATCH (m:Method)<-[:PROPOSES|INTRODUCES]-(p:Paper)
+        WHERE toLower(m.name) IN $method_names
+        OPTIONAL MATCH (p)-[:HAS_PROBLEM]->(:Problem)-[:HAS_GAP]->(:Gap)
+                        -[:ADDRESSED_BY]->(:CoreIdea)-[:MAKES_CLAIM]->(cl:Claim)
+        OPTIONAL MATCH (cl)-[r:SUPPORTED_BY]->(e:Evidence)
+        WITH m.name AS method, p.paper_id AS paper_id,
+             count(DISTINCT cl) AS claim_count,
+             count(DISTINCT e) AS evidence_count,
+             collect(DISTINCT r.strength) AS strengths,
+             collect(DISTINCT {
+                 claim_id: cl.claim_id,
+                 text: cl.text,
+                 severity: cl.severity,
+                 has_evidence: CASE WHEN e IS NOT NULL THEN true ELSE false END
+             }) AS claim_details
+        RETURN method, paper_id, claim_count, evidence_count,
+               strengths, claim_details
+        ORDER BY method
+        """
+        normalized = [n.strip().lower() for n in method_names]
+        async with self.driver.session() as session:
+            result = await session.run(query, {"method_names": normalized})
+            return await result.data()
+
+    async def find_bridge_papers(
+        self, method_a_names: list[str], method_b_names: list[str]
+    ) -> list[dict[str, Any]]:
+        """Find papers that reference methods from both domains."""
+        if not method_a_names or not method_b_names:
+            return []
+        query = """
+        MATCH (p:Paper)-[:USES|PROPOSES|INTRODUCES]->(m1:Method)
+        WHERE toLower(m1.name) IN $method_a
+        WITH p, collect(DISTINCT m1.name) AS methods_a
+        MATCH (p)-[:USES|PROPOSES|INTRODUCES]->(m2:Method)
+        WHERE toLower(m2.name) IN $method_b
+        WITH p, methods_a, collect(DISTINCT m2.name) AS methods_b
+        RETURN p.paper_id AS paper_id, p.title AS title,
+               p.year AS year, p.venue AS venue,
+               methods_a, methods_b
+        ORDER BY p.year DESC
+        LIMIT 20
+        """
+        norm_a = [n.strip().lower() for n in method_a_names]
+        norm_b = [n.strip().lower() for n in method_b_names]
+        async with self.driver.session() as session:
+            result = await session.run(query, {"method_a": norm_a, "method_b": norm_b})
+            return await result.data()
+

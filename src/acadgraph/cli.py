@@ -280,9 +280,12 @@ def ingest(jsonl_path: str, limit: int | None, batch_size: int, skip_existing: b
 
 @main.command()
 @click.argument("idea")
-@click.option("--mode", type=click.Choice(["competition", "gap", "recall"]), default="competition")
+@click.option("--mode", type=click.Choice(["competition", "gap", "recall", "innovation", "bridge"]), default="competition")
 @click.option("-k", default=10, help="Number of results")
-def query(idea: str, mode: str, k: int) -> None:
+@click.option("--methods", default="", help="Comma-separated method names (for innovation mode)")
+@click.option("--method-a", default="", help="First method family (for bridge mode)")
+@click.option("--method-b", default="", help="Second method family (for bridge mode)")
+def query(idea: str, mode: str, k: int, methods: str, method_a: str, method_b: str) -> None:
     """Query the KG with a research idea."""
 
     async def _query():
@@ -303,7 +306,12 @@ def query(idea: str, mode: str, k: int) -> None:
 
             elif mode == "gap":
                 console.print(f"[bold]Generating gap statement for:[/] {idea}")
-                gap = await engine.generate_gap_statement(idea)
+                method_list = [m.strip() for m in methods.split(",") if m.strip()]
+                if method_list:
+                    gap = await engine.gap_grounded_statement(idea, method_list)
+                    console.print("[dim]Using graph-grounded gap generation[/dim]")
+                else:
+                    gap = await engine.generate_gap_statement(idea)
                 console.print(f"\n[bold green]Gap Statement:[/]\n{gap.statement}")
                 console.print(f"\n[bold]Problem:[/] {gap.problem}")
                 console.print(f"[bold]Failure:[/] {gap.failure_constraint}")
@@ -323,6 +331,92 @@ def query(idea: str, mode: str, k: int) -> None:
                         r.get("recall_path", ""),
                     )
                 console.print(table)
+
+            elif mode == "innovation":
+                method_list = [m.strip() for m in methods.split(",") if m.strip()]
+                if not method_list:
+                    console.print("[red]Error: --methods is required for innovation mode[/]")
+                    return
+                console.print(f"[bold]Finding innovation paths for:[/] {idea}")
+                console.print(f"[dim]Methods: {method_list}[/dim]")
+                path = await engine.find_innovation_paths(idea, method_list, k=k)
+
+                console.print(f"\n[bold green]Suggested Innovation:[/]\n{path.suggested_combination}")
+
+                if path.gaps:
+                    table = Table(title=f"Known Gaps ({len(path.gaps)} found)")
+                    table.add_column("Method", style="cyan")
+                    table.add_column("Problem", style="white", max_width=40)
+                    table.add_column("Failure Mode", style="yellow", max_width=30)
+                    for g in path.gaps[:10]:
+                        table.add_row(
+                            str(g.get("method", "")),
+                            str(g.get("problem", ""))[:40],
+                            str(g.get("failure_mode", ""))[:30],
+                        )
+                    console.print(table)
+
+                if path.unaddressed_gaps:
+                    table = Table(title=f"Open Gaps ({len(path.unaddressed_gaps)} unresolved)")
+                    table.add_column("Problem", style="white", max_width=40)
+                    table.add_column("Constraint", style="red", max_width=30)
+                    for g in path.unaddressed_gaps[:10]:
+                        table.add_row(
+                            str(g.get("problem", ""))[:40],
+                            str(g.get("constraint", ""))[:30],
+                        )
+                    console.print(table)
+
+                if path.addressing_ideas:
+                    table = Table(title=f"Existing Solutions ({len(path.addressing_ideas)})")
+                    table.add_column("Mechanism", style="green", max_width=40)
+                    table.add_column("Innovation", style="cyan", max_width=30)
+                    for ci in path.addressing_ideas[:10]:
+                        table.add_row(
+                            str(ci.get("mechanism", ""))[:40],
+                            str(ci.get("key_innovation", ""))[:30],
+                        )
+                    console.print(table)
+
+            elif mode == "bridge":
+                a_names = [m.strip() for m in method_a.split(",") if m.strip()]
+                b_names = [m.strip() for m in method_b.split(",") if m.strip()]
+                if not a_names or not b_names:
+                    console.print("[red]Error: --method-a and --method-b required for bridge mode[/]")
+                    return
+                console.print(f"[bold]Finding bridges:[/] {a_names} ↔ {b_names}")
+                bridge = await engine.find_cross_domain_bridges(
+                    a_names[0], b_names[0],
+                    method_a_variants=a_names[1:],
+                    method_b_variants=b_names[1:],
+                )
+                console.print(f"\n[bold green]Novelty Assessment:[/]\n{bridge.combination_novelty}")
+
+                if bridge.shared_concepts:
+                    table = Table(title=f"Shared Concepts ({len(bridge.shared_concepts)})")
+                    table.add_column("Type", style="cyan")
+                    table.add_column("Name", style="white")
+                    table.add_column("Papers A", style="green")
+                    for sc in bridge.shared_concepts[:15]:
+                        table.add_row(
+                            str(sc.get("entity_type", "")),
+                            str(sc.get("name", "")),
+                            str(sc.get("papers_a_count", 0)),
+                        )
+                    console.print(table)
+
+                if bridge.bridge_papers:
+                    table = Table(title=f"Bridge Papers ({len(bridge.bridge_papers)})")
+                    table.add_column("Paper ID", style="cyan")
+                    table.add_column("Title", style="white", max_width=50)
+                    table.add_column("Year", style="yellow")
+                    for bp in bridge.bridge_papers[:10]:
+                        table.add_row(
+                            str(bp.get("paper_id", ""))[:30],
+                            str(bp.get("title", ""))[:50],
+                            str(bp.get("year", "")),
+                        )
+                    console.print(table)
 
     asyncio.run(_query())
 

@@ -9,6 +9,7 @@ Argumentation Chains: PROBLEM → GAP → CORE_IDEA → CLAIM → EVIDENCE
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -30,6 +31,29 @@ def generate_id(prefix: str = "") -> str:
 def hash_text(text: str) -> str:
     """Deterministic hash for deduplication."""
     return hashlib.sha256(text.strip().lower().encode()).hexdigest()[:16]
+
+
+def normalize_entity_name(name: str) -> str:
+    """Normalize entity name for deterministic deduplication.
+
+    Ensures that trivially equivalent names produce the same entity_id:
+      'Hilbert–Schmidt' == 'Hilbert-Schmidt'
+      'F1-score'        == 'F1 score'
+      'Earth Mover's'   == 'Earth Mover'
+    """
+    s = name.strip().lower()
+    # Normalize unicode dashes (en-dash, em-dash) to ASCII hyphen
+    s = s.replace('\u2013', '-').replace('\u2014', '-').replace('\u2012', '-')
+    # Remove apostrophes and backticks
+    s = s.replace("'", "").replace("\u2019", "").replace("`", "")
+    # Normalize hyphens to spaces
+    s = s.replace("-", " ")
+    # Collapse multiple spaces
+    s = re.sub(r'\s+', ' ', s).strip()
+    # Simple plural normalization (but not for short words or double-s)
+    if len(s) > 3 and s.endswith('s') and not s.endswith('ss'):
+        s = s[:-1]
+    return s
 
 
 # ============================================================================
@@ -146,8 +170,8 @@ class Entity:
 
     def __post_init__(self):
         if not self.entity_id:
-            # Deterministic ID: same name + type → same entity_id → MERGE dedup
-            canonical = f"{self.entity_type.value.lower()}:{self.name.strip().lower()}"
+            # Deterministic ID: normalized name + type → same entity_id → MERGE dedup
+            canonical = f"{self.entity_type.value.lower()}:{normalize_entity_name(self.name)}"
             self.entity_id = f"{self.entity_type.value.lower()}_{hash_text(canonical)}"
 
 
@@ -551,6 +575,38 @@ class EvolutionTimeline:
     """Timeline showing how a method evolved."""
     method_name: str = ""
     steps: list[EvolutionStep] = field(default_factory=list)
+
+
+@dataclass
+class InnovationPath:
+    """A cross-method innovation path from Method→Gap→CoreIdea."""
+    source_methods: list[str] = field(default_factory=list)
+    gaps: list[dict[str, Any]] = field(default_factory=list)
+    addressing_ideas: list[dict[str, Any]] = field(default_factory=list)
+    unaddressed_gaps: list[dict[str, Any]] = field(default_factory=list)
+    suggested_combination: str = ""
+    evidence_support: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class CrossDomainBridge:
+    """Cross-domain method bridge discovery result."""
+    method_a: str = ""
+    method_b: str = ""
+    shared_concepts: list[dict[str, Any]] = field(default_factory=list)
+    bridge_papers: list[dict[str, Any]] = field(default_factory=list)
+    combination_novelty: str = ""
+
+
+@dataclass
+class ComponentEvidence:
+    """Evidence strength analysis for one method component."""
+    method_name: str = ""
+    paper_count: int = 0
+    claim_count: int = 0
+    evidence_count: int = 0
+    avg_support_strength: float = 0.0
+    unsupported_claims: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

@@ -177,6 +177,29 @@ class KgRepository(Protocol):
     async def traverse_evidence_chain(self, claim_id: str) -> dict[str, Any]:
         """Traverse the full evidence chain for a Claim."""
 
+    # Innovation Path Mining
+    async def find_gaps_for_methods(self, method_names: list[str]) -> list[dict[str, Any]]:
+        """Find Gap/Problem nodes associated with given methods."""
+
+    async def find_addressing_ideas(self, gap_ids: list[str]) -> list[dict[str, Any]]:
+        """Find CoreIdeas that address given Gaps."""
+
+    async def find_cross_domain_bridges(
+        self, method_a_names: list[str], method_b_names: list[str]
+    ) -> list[dict[str, Any]]:
+        """Find shared concepts/tasks/datasets between two method groups."""
+
+    async def find_unsupported_gaps(self, method_names: list[str]) -> list[dict[str, Any]]:
+        """Find Gaps with no ADDRESSED_BY CoreIdea for given methods."""
+
+    async def get_component_evidence(self, method_names: list[str]) -> list[dict[str, Any]]:
+        """Get evidence strength breakdown per method component."""
+
+    async def find_bridge_papers(
+        self, method_a_names: list[str], method_b_names: list[str]
+    ) -> list[dict[str, Any]]:
+        """Find papers referencing methods from both domains."""
+
 
 @runtime_checkable
 class VectorIndex(Protocol):
