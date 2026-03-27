@@ -1,0 +1,22 @@
+{
+  "include": ["src", "tests"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "basic",
+  "useLibraryCodeForTypes": true,
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "warning",
+  "executionEnvironments": [
+    {
+      "root": "src",
+      "pythonVersion": "3.13",
+      "extraPaths": ["src"]
+    },
+    {
+      "root": "tests",
+      "pythonVersion": "3.13",
+      "extraPaths": ["src"]
+    }
+  ]
+}

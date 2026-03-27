@@ -1,7 +1,9 @@
 """Tests for innovation path mining query methods."""
 
 import asyncio
+from typing import Any
 
+from acadgraph.kg.interfaces import KgRepository, VectorIndex
 from acadgraph.kg.ontology import (
     CLAIM_COLLECTION,
     DOC_KIND_CLAIM,
@@ -23,11 +25,11 @@ class _StubEmbedding:
         return [0.1, 0.2, 0.3]
 
 
-class _StubQdrant:
+class _StubQdrant(VectorIndex):  # type: ignore[misc]
     def __init__(self):
-        self.calls = []
+        self.calls: list[Any] = []
 
-    async def search_similar(self, collection, _query_vector, k=10, filters=None):
+    async def search_similar(self, collection: str, _query_vector: list[float], k: int = 10, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         self.calls.append((collection, k, filters))
         if collection == ENTITY_COLLECTION:
             return [
@@ -47,11 +49,11 @@ class _StubQdrant:
             ]
         return []
 
-    async def get_collection_count(self, _collection):
+    async def get_collection_count(self, _collection: str) -> int:
         return 0
 
 
-class _StubNeo4j:
+class _StubNeo4j(KgRepository):  # type: ignore[misc]
     """Mock Neo4j with innovation path mining methods."""
 
     async def find_gaps_for_methods(self, method_names):
@@ -174,7 +176,7 @@ class TestFindInnovationPaths:
 
     def test_returns_innovation_path(self):
         engine = _build_engine()
-        result = asyncio.run(engine.find_innovation_paths(
+        result: InnovationPath = asyncio.run(engine.find_innovation_paths(
             "GUI agent with visual grounding",
             ["SAM", "PPO"],
             k=5,
@@ -186,7 +188,7 @@ class TestFindInnovationPaths:
 
     def test_finds_addressing_ideas(self):
         engine = _build_engine()
-        result = asyncio.run(engine.find_innovation_paths(
+        result: InnovationPath = asyncio.run(engine.find_innovation_paths(
             "GUI agent", ["SAM"], k=5,
         ))
         assert len(result.addressing_ideas) >= 1
@@ -194,7 +196,7 @@ class TestFindInnovationPaths:
 
     def test_finds_unaddressed_gaps(self):
         engine = _build_engine()
-        result = asyncio.run(engine.find_innovation_paths(
+        result: InnovationPath = asyncio.run(engine.find_innovation_paths(
             "GUI agent", ["SAM"], k=5,
         ))
         assert len(result.unaddressed_gaps) >= 1
@@ -202,7 +204,7 @@ class TestFindInnovationPaths:
 
     def test_llm_suggestion_populated(self):
         engine = _build_engine()
-        result = asyncio.run(engine.find_innovation_paths(
+        result: InnovationPath = asyncio.run(engine.find_innovation_paths(
             "GUI agent", ["SAM"], k=5,
         ))
         assert "SAM" in result.suggested_combination
@@ -276,7 +278,7 @@ class TestEmptyInputs:
 
     def test_empty_methods_returns_empty_innovation(self):
         engine = _build_engine()
-        result = asyncio.run(engine.find_innovation_paths("idea", [], k=5))
+        result: InnovationPath = asyncio.run(engine.find_innovation_paths("idea", [], k=5))
         assert isinstance(result, InnovationPath)
         assert result.gaps == []
 

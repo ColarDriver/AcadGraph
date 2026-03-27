@@ -16,6 +16,14 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from acadgraph.config import AppConfig
+    from acadgraph.embedding_client import EmbeddingClient
+    from acadgraph.kg.storage.neo4j_store import Neo4jKGStore
+    from acadgraph.kg.storage.qdrant_store import QdrantKGStore
+    from acadgraph.llm_client import LLMClient
 
 import click
 from rich.console import Console
@@ -23,6 +31,15 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 console = Console()
+
+
+def _trunc(value: object, maxlen: int) -> str:
+    """Convert *value* to str and truncate to *maxlen* characters."""
+    s = str(value)
+    if len(s) <= maxlen:
+        return s
+    # Use join to avoid slice syntax (Pyre2 false-positive with PEP 563).
+    return "".join(s[i] for i in range(maxlen))
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -35,9 +52,11 @@ def setup_logging(level: str = "INFO") -> None:
     )
 
 
-async def _get_components():
+async def _get_components() -> tuple[
+    "Neo4jKGStore", "QdrantKGStore", "LLMClient", "EmbeddingClient", "AppConfig"
+]:
     """Initialize all components."""
-    from acadgraph.config import get_config
+    from acadgraph.config import AppConfig, get_config
     from acadgraph.embedding_client import EmbeddingClient
     from acadgraph.kg.storage.neo4j_store import Neo4jKGStore
     from acadgraph.kg.storage.qdrant_store import QdrantKGStore
@@ -223,7 +242,7 @@ def ingest(jsonl_path: str, limit: int | None, batch_size: int, skip_existing: b
             total = len(papers)
             console.print(f"[bold]Loaded {total} papers, processing...[/]\n")
 
-            ok, fail = 0, 0
+            counts = {"ok": 0, "fail": 0}
             t0 = time.time()
 
             # Sliding window: always keep `batch_size` papers in flight
@@ -231,22 +250,21 @@ def ingest(jsonl_path: str, limit: int | None, batch_size: int, skip_existing: b
             lock = asyncio.Lock()
 
             async def _process_one(paper, idx):
-                nonlocal ok, fail
                 async with sem:
                     pid = paper.paper_id or paper.title[:30]
                     try:
                         r = await builder.add_paper(paper)
                         async with lock:
                             if r.errors:
-                                fail += 1
-                                done = ok + fail
+                                counts["fail"] += 1
+                                done = counts["ok"] + counts["fail"]
                                 console.print(
                                     f"[yellow][{done}/{total}] ⚠ {pid}: "
                                     f"{r.errors[0][:60]}[/]"
                                 )
                             else:
-                                ok += 1
-                                done = ok + fail
+                                counts["ok"] += 1
+                                done = counts["ok"] + counts["fail"]
                                 console.print(
                                     f"[green][{done}/{total}] ✓ {pid}[/] "
                                     f"({r.entities_added}E "
@@ -256,8 +274,8 @@ def ingest(jsonl_path: str, limit: int | None, batch_size: int, skip_existing: b
                                 )
                     except Exception as e:
                         async with lock:
-                            fail += 1
-                            done = ok + fail
+                            counts["fail"] += 1
+                            done = counts["ok"] + counts["fail"]
                             console.print(
                                 f"[red][{done}/{total}] ✗ {pid}: {e}[/]"
                             )
@@ -271,8 +289,8 @@ def ingest(jsonl_path: str, limit: int | None, batch_size: int, skip_existing: b
 
             elapsed = time.time() - t0
             console.print(
-                f"\n[bold green]Done:[/] {ok}/{total} succeeded, "
-                f"{fail} errors, {elapsed:.1f}s total"
+                f"\n[bold green]Done:[/] {counts['ok']}/{total} succeeded, "
+                f"{counts['fail']} errors, {elapsed:.1f}s total"
             )
 
     asyncio.run(_ingest())
@@ -351,8 +369,8 @@ def query(idea: str, mode: str, k: int, methods: str, method_a: str, method_b: s
                     for g in path.gaps[:10]:
                         table.add_row(
                             str(g.get("method", "")),
-                            str(g.get("problem", ""))[:40],
-                            str(g.get("failure_mode", ""))[:30],
+                            _trunc(g.get("problem", ""), 40),
+                            _trunc(g.get("failure_mode", ""), 30),
                         )
                     console.print(table)
 
@@ -362,8 +380,8 @@ def query(idea: str, mode: str, k: int, methods: str, method_a: str, method_b: s
                     table.add_column("Constraint", style="red", max_width=30)
                     for g in path.unaddressed_gaps[:10]:
                         table.add_row(
-                            str(g.get("problem", ""))[:40],
-                            str(g.get("constraint", ""))[:30],
+                            _trunc(g.get("problem", ""), 40),
+                            _trunc(g.get("constraint", ""), 30),
                         )
                     console.print(table)
 
@@ -373,8 +391,8 @@ def query(idea: str, mode: str, k: int, methods: str, method_a: str, method_b: s
                     table.add_column("Innovation", style="cyan", max_width=30)
                     for ci in path.addressing_ideas[:10]:
                         table.add_row(
-                            str(ci.get("mechanism", ""))[:40],
-                            str(ci.get("key_innovation", ""))[:30],
+                            _trunc(ci.get("mechanism", ""), 40),
+                            _trunc(ci.get("key_innovation", ""), 30),
                         )
                     console.print(table)
 
@@ -385,10 +403,14 @@ def query(idea: str, mode: str, k: int, methods: str, method_a: str, method_b: s
                     console.print("[red]Error: --method-a and --method-b required for bridge mode[/]")
                     return
                 console.print(f"[bold]Finding bridges:[/] {a_names} ↔ {b_names}")
+                # Use list() + range() to slice — avoids PEP 563 / Pyre2
+                # false-positive on list.__getitem__(slice).
+                a_variants = [a_names[i] for i in range(1, len(a_names))]
+                b_variants = [b_names[i] for i in range(1, len(b_names))]
                 bridge = await engine.find_cross_domain_bridges(
                     a_names[0], b_names[0],
-                    method_a_variants=a_names[1:],
-                    method_b_variants=b_names[1:],
+                    method_a_variants=a_variants,
+                    method_b_variants=b_variants,
                 )
                 console.print(f"\n[bold green]Novelty Assessment:[/]\n{bridge.combination_novelty}")
 
@@ -412,8 +434,8 @@ def query(idea: str, mode: str, k: int, methods: str, method_a: str, method_b: s
                     table.add_column("Year", style="yellow")
                     for bp in bridge.bridge_papers[:10]:
                         table.add_row(
-                            str(bp.get("paper_id", ""))[:30],
-                            str(bp.get("title", ""))[:50],
+                            _trunc(bp.get("paper_id", ""), 30),
+                            _trunc(bp.get("title", ""), 50),
                             str(bp.get("year", "")),
                         )
                     console.print(table)

@@ -1,0 +1,13 @@
+{
+  "site_package_search_strategy": "pep561",
+  "source_directories": [
+    {
+      "import_root": "src"
+    },
+    {
+      "import_root": "tests"
+    }
+  ],
+  "strict_mode": false,
+  "python_version": "3.13"
+}
