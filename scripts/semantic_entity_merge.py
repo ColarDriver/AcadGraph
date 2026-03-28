@@ -9,6 +9,7 @@ Complexity: O(n × k × log n) instead of O(n²)
 Usage:
     python scripts/semantic_entity_merge.py [--dry-run] [--threshold 0.85] [--types Method,Task]
 """
+# type: ignore
 
 from __future__ import annotations
 
@@ -349,10 +350,11 @@ def execute_merges(
     driver,
     merges: list[tuple[EntityNode, EntityNode, str]],
     dry_run: bool = False,
-) -> int:
-    """Merge entity pairs in Neo4j. Uses Union-Find to handle transitive merges."""
+) -> tuple[int, list[str]]:
+    """Merge entity pairs in Neo4j. Uses Union-Find to handle transitive merges.
+    Returns (merged_count, deleted_entity_ids)."""
     if not merges:
-        return 0
+        return 0, []
 
     # Union-Find to handle chains: if A≈B and B≈C, merge all three
     parent: dict[int, int] = {}
@@ -370,8 +372,12 @@ def execute_merges(
             parent[rb] = ra
             canonical[ra] = name
 
+    # Build entity_id lookup from merge pairs
+    neo_id_to_entity_id: dict[int, str] = {}
     for keeper, dupe, canon in merges:
         union(keeper.neo_id, dupe.neo_id, canon)
+        neo_id_to_entity_id[keeper.neo_id] = keeper.entity_id
+        neo_id_to_entity_id[dupe.neo_id] = dupe.entity_id
 
     # Group by root
     groups: dict[int, list[int]] = {}
@@ -384,6 +390,7 @@ def execute_merges(
         groups.setdefault(root, []).append(nid)
 
     merged = 0
+    deleted_entity_ids: list[str] = []
     with driver.session() as s:
         for root_id, members in groups.items():
             dupes = [m for m in members if m != root_id]
@@ -396,49 +403,70 @@ def execute_merges(
                 logger.info("  [DRY-RUN] Merge group: keeper=%d, dupes=%s → '%s'",
                             root_id, dupes, canon_name)
                 merged += len(dupes)
+                deleted_entity_ids.extend(
+                    neo_id_to_entity_id[d] for d in dupes if d in neo_id_to_entity_id
+                )
                 continue
 
-            for dupe_id in dupes:
-                # Move incoming rels
-                rels_in = list(s.run("""
-                    MATCH (dupe) WHERE id(dupe) = $did
-                    MATCH (dupe)<-[r]-(src)
+            # Batch merge using UNWIND
+            # 1. Move incoming rels
+            rel_types_in = list(s.run("""
+                UNWIND $dids AS did
+                MATCH (dupe) WHERE id(dupe) = did
+                MATCH (dupe)<-[r]-(src)
+                WHERE id(src) <> $kid
+                RETURN DISTINCT type(r) AS rtype
+            """, dids=dupes, kid=root_id))
+
+            for rt in rel_types_in:
+                rtype = rt["rtype"]
+                s.run(f"""
+                    UNWIND $dids AS did
+                    MATCH (dupe) WHERE id(dupe) = did
+                    MATCH (dupe)<-[r:{rtype}]-(src)
                     WHERE id(src) <> $kid
-                    RETURN type(r) AS rtype, id(src) AS src_id
-                """, did=dupe_id, kid=root_id))
+                    MATCH (keeper) WHERE id(keeper) = $kid
+                    MERGE (src)-[:{rtype}]->(keeper)
+                """, dids=dupes, kid=root_id)
 
-                for rel in rels_in:
-                    s.run(f"""
-                        MATCH (src) WHERE id(src) = $sid
-                        MATCH (keeper) WHERE id(keeper) = $kid
-                        MERGE (src)-[:{rel['rtype']}]->(keeper)
-                    """, sid=rel["src_id"], kid=root_id)
+            # 2. Move outgoing rels
+            rel_types_out = list(s.run("""
+                UNWIND $dids AS did
+                MATCH (dupe) WHERE id(dupe) = did
+                MATCH (dupe)-[r]->(dst)
+                WHERE id(dst) <> $kid
+                RETURN DISTINCT type(r) AS rtype
+            """, dids=dupes, kid=root_id))
 
-                # Move outgoing rels
-                rels_out = list(s.run("""
-                    MATCH (dupe) WHERE id(dupe) = $did
-                    MATCH (dupe)-[r]->(dst)
+            for rt in rel_types_out:
+                rtype = rt["rtype"]
+                s.run(f"""
+                    UNWIND $dids AS did
+                    MATCH (dupe) WHERE id(dupe) = did
+                    MATCH (dupe)-[r:{rtype}]->(dst)
                     WHERE id(dst) <> $kid
-                    RETURN type(r) AS rtype, id(dst) AS dst_id
-                """, did=dupe_id, kid=root_id))
+                    MATCH (keeper) WHERE id(keeper) = $kid
+                    MERGE (keeper)-[:{rtype}]->(dst)
+                """, dids=dupes, kid=root_id)
 
-                for rel in rels_out:
-                    s.run(f"""
-                        MATCH (keeper) WHERE id(keeper) = $kid
-                        MATCH (dst) WHERE id(dst) = $did2
-                        MERGE (keeper)-[:{rel['rtype']}]->(dst)
-                    """, kid=root_id, did2=rel["dst_id"])
+            # 3. Delete all dupes
+            s.run("""
+                UNWIND $dids AS did
+                MATCH (n) WHERE id(n) = did
+                DETACH DELETE n
+            """, dids=dupes)
 
-                # Delete dupe
-                s.run("MATCH (n) WHERE id(n) = $did DETACH DELETE n", did=dupe_id)
-                merged += 1
+            deleted_entity_ids.extend(
+                neo_id_to_entity_id[d] for d in dupes if d in neo_id_to_entity_id
+            )
+            merged += len(dupes)
 
             # Update keeper name
             if canon_name:
                 s.run("MATCH (n) WHERE id(n) = $kid SET n.name = $name",
                       kid=root_id, name=canon_name)
 
-    return merged
+    return merged, deleted_entity_ids
 
 
 # ─── Phase 0: Exact + Normalized string match merge ───────────────────
@@ -451,7 +479,7 @@ def _normalize_name(name: str) -> str:
     # Normalize unicode dashes to ASCII hyphen
     s = s.replace('\u2013', '-').replace('\u2014', '-').replace('\u2012', '-')
     # Remove apostrophes and backticks
-    s = s.replace("'", "").replace("'", "").replace("`", "")
+    s = s.replace("'", "").replace("\u2019", "").replace("`", "")
     # Normalize hyphens: "trade-off" → "tradeoff", "f1-score" → "f1 score"
     s = s.replace("-", " ")
     # Collapse multiple spaces
@@ -502,47 +530,90 @@ def exact_merge(driver, entity_type: str, dry_run: bool = False) -> tuple[int, l
                 deleted_entity_ids.extend(eid for _, _, eid in dupes if eid)
                 continue
 
-            for dupe_id, dupe_name, dupe_eid in dupes:
-                # Move incoming relationships
-                rels_in = list(s.run("""
-                    MATCH (dupe) WHERE id(dupe) = $did
-                    MATCH (dupe)<-[r]-(src)
+            # Batch merge: collect all dupe_ids then use batch Cypher
+            dupe_neo_ids = [did for did, _, _ in dupes]
+
+            # 1. Move ALL incoming rels from ALL dupes to keeper in one query per rel type
+            rel_types_in = list(s.run("""
+                UNWIND $dids AS did
+                MATCH (dupe) WHERE id(dupe) = did
+                MATCH (dupe)<-[r]-(src)
+                WHERE id(src) <> $kid
+                RETURN DISTINCT type(r) AS rtype
+            """, dids=dupe_neo_ids, kid=keeper_id))
+
+            for rt in rel_types_in:
+                rtype = rt["rtype"]
+                s.run(f"""
+                    UNWIND $dids AS did
+                    MATCH (dupe) WHERE id(dupe) = did
+                    MATCH (dupe)<-[r:{rtype}]-(src)
                     WHERE id(src) <> $kid
-                    RETURN type(r) AS rtype, id(src) AS src_id
-                """, did=dupe_id, kid=keeper_id))
+                    MATCH (keeper) WHERE id(keeper) = $kid
+                    MERGE (src)-[:{rtype}]->(keeper)
+                """, dids=dupe_neo_ids, kid=keeper_id)
 
-                for rel in rels_in:
-                    s.run(f"""
-                        MATCH (src) WHERE id(src) = $sid
-                        MATCH (keeper) WHERE id(keeper) = $kid
-                        MERGE (src)-[:{rel['rtype']}]->(keeper)
-                    """, sid=rel["src_id"], kid=keeper_id)
+            # 2. Move ALL outgoing rels
+            rel_types_out = list(s.run("""
+                UNWIND $dids AS did
+                MATCH (dupe) WHERE id(dupe) = did
+                MATCH (dupe)-[r]->(dst)
+                WHERE id(dst) <> $kid
+                RETURN DISTINCT type(r) AS rtype
+            """, dids=dupe_neo_ids, kid=keeper_id))
 
-                # Move outgoing relationships
-                rels_out = list(s.run("""
-                    MATCH (dupe) WHERE id(dupe) = $did
-                    MATCH (dupe)-[r]->(dst)
+            for rt in rel_types_out:
+                rtype = rt["rtype"]
+                s.run(f"""
+                    UNWIND $dids AS did
+                    MATCH (dupe) WHERE id(dupe) = did
+                    MATCH (dupe)-[r:{rtype}]->(dst)
                     WHERE id(dst) <> $kid
-                    RETURN type(r) AS rtype, id(dst) AS dst_id
-                """, did=dupe_id, kid=keeper_id))
+                    MATCH (keeper) WHERE id(keeper) = $kid
+                    MERGE (keeper)-[:{rtype}]->(dst)
+                """, dids=dupe_neo_ids, kid=keeper_id)
 
-                for rel in rels_out:
-                    s.run(f"""
-                        MATCH (keeper) WHERE id(keeper) = $kid
-                        MATCH (dst) WHERE id(dst) = $did2
-                        MERGE (keeper)-[:{rel['rtype']}]->(dst)
-                    """, kid=keeper_id, did2=rel["dst_id"])
+            # 3. Delete all dupes in one query
+            s.run("""
+                UNWIND $dids AS did
+                MATCH (n) WHERE id(n) = did
+                DETACH DELETE n
+            """, dids=dupe_neo_ids)
 
-                # Delete duplicate
-                s.run("MATCH (n) WHERE id(n) = $did DETACH DELETE n", did=dupe_id)
-                if dupe_eid:
-                    deleted_entity_ids.append(dupe_eid)
-                merged += 1
+            deleted_entity_ids.extend(eid for _, _, eid in dupes if eid)
+            merged += len(dupes)
 
             if merged % 1000 == 0 and merged > 0:
                 logger.info("  Phase 0: Merged %d duplicates so far...", merged)
 
     return merged, deleted_entity_ids
+
+
+# ─── Qdrant cleanup helper ────────────────────────────────────────────
+def _eid_to_qdrant_id(entity_id: str) -> int:
+    """Convert entity_id string to Qdrant integer point ID (same logic as qdrant_store.py)."""
+    import hashlib as _hl
+    return int(_hl.sha256(entity_id.encode()).hexdigest()[:15], 16)
+
+
+def cleanup_qdrant_embeddings(qdrant: QdrantClient, deleted_eids: list[str], dry_run: bool = False):
+    """Delete merged entity embeddings from Qdrant 'entities' collection."""
+    if not deleted_eids or dry_run:
+        return
+    QDRANT_ENTITY_COLLECTION = "entities"
+    # Convert string entity_ids to Qdrant integer point IDs
+    int_ids = [_eid_to_qdrant_id(eid) for eid in deleted_eids]
+    batch_size = 500
+    for i in range(0, len(int_ids), batch_size):
+        batch = int_ids[i:i + batch_size]
+        try:
+            qdrant.delete(
+                collection_name=QDRANT_ENTITY_COLLECTION,
+                points_selector=batch,
+            )
+        except Exception as e:
+            logger.debug("Qdrant cleanup skipped (batch %d): %s", i, e)
+    logger.info("  Cleaned %d embeddings from Qdrant", len(deleted_eids))
 
 
 # ─── Main ──────────────────────────────────────────────────────────────
@@ -555,23 +626,9 @@ async def process_entity_type(
 
     # Phase 0: Exact string match merge (fast, no LLM)
     logger.info("  Phase 0: Exact string match merge...")
-    exact_merged, deleted_eids = exact_merge(driver, entity_type, dry_run=dry_run)
+    exact_merged, p0_deleted_eids = exact_merge(driver, entity_type, dry_run=dry_run)
     logger.info("  Phase 0: Merged %d exact duplicates", exact_merged)
-
-    # Clean up Qdrant: delete embeddings for merged entities
-    if deleted_eids and not dry_run:
-        QDRANT_ENTITY_COLLECTION = "entities"
-        batch_size = 500
-        for i in range(0, len(deleted_eids), batch_size):
-            batch = deleted_eids[i:i + batch_size]
-            try:
-                qdrant.delete(
-                    collection_name=QDRANT_ENTITY_COLLECTION,
-                    points_selector=batch,
-                )
-            except Exception as e:
-                logger.debug("Qdrant cleanup skipped (batch %d): %s", i, e)
-        logger.info("  Cleaned %d embeddings from Qdrant", len(deleted_eids))
+    cleanup_qdrant_embeddings(qdrant, p0_deleted_eids, dry_run=dry_run)
 
     # Step 1: Load (after exact merge, count is reduced)
     entities = load_entities(driver, entity_type)
@@ -607,8 +664,11 @@ async def process_entity_type(
     # Step 5: Execute
     prefix = "[DRY-RUN] " if dry_run else ""
     logger.info("  %sExecuting merges...", prefix)
-    n = execute_merges(driver, merges, dry_run=dry_run)
+    n, p1_deleted_eids = execute_merges(driver, merges, dry_run=dry_run)
     logger.info("  %sMerged %d entities", prefix, n)
+
+    # Step 6: Qdrant cleanup for Phase 1
+    cleanup_qdrant_embeddings(qdrant, p1_deleted_eids, dry_run=dry_run)
 
     return {"type": entity_type, "total": len(entities), "pairs": len(pairs),
             "exact_merged": exact_merged, "semantic_merged": n}
