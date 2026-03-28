@@ -251,8 +251,8 @@ Pairs to evaluate:
 
 async def llm_decide_merges(
     pairs: list[tuple[EntityNode, EntityNode, float]],
-    batch_size: int = 20,
-    max_concurrent: int = 8,
+    batch_size: int = 40,
+    max_concurrent: int = 32,
 ) -> list[tuple[EntityNode, EntityNode, str]]:
     """Use LLM to decide which pairs should be merged. Runs concurrent batches."""
     client = AsyncOpenAI(base_url=LLM_BASE, api_key=LLM_KEY)
@@ -318,18 +318,31 @@ async def llm_decide_merges(
                             logger.debug("JSON repair failed for batch %d: %s", batch_idx, repaired[:200])
 
                 if result:
-                    for dec in result.get("decisions", []):
+                    decisions = result.get("decisions", [])
+                    approved = 0
+                    for dec in decisions:
                         pid = dec.get("pair_id", -1)
                         if 0 <= pid < len(batch) and dec.get("same", False):
                             a, b, _ = batch[pid]
                             canonical = dec.get("canonical_name", a.name)
                             merges.append((a, b, canonical))
+                            approved += 1
+                            logger.info("    ✅ MERGE: '%s' + '%s' → '%s'", a.name, b.name, canonical)
+                        elif 0 <= pid < len(batch):
+                            a, b, _ = batch[pid]
+                            logger.debug("    ❌ SKIP: '%s' ≠ '%s'", a.name, b.name)
+                    nonlocal completed_batches
+                    completed_batches += 1
+                    logger.info("  Batch %d done: %d/%d approved  [%d/%d batches]",
+                                batch_idx, approved, len(decisions),
+                                completed_batches, total_batches)
                 else:
                     logger.debug("No JSON found in LLM batch %d response: %s", batch_idx, content[:150])
             except Exception as e:
                 logger.warning("LLM batch %d failed: %s", batch_idx, e)
 
     # Create all tasks
+    completed_batches = 0
     tasks = []
     for i in range(0, len(pairs), batch_size):
         batch = pairs[i:i + batch_size]
