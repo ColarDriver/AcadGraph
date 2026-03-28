@@ -47,8 +47,24 @@ from qdrant_client.models import (
     VectorParams,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s")
-logger = logging.getLogger(__name__)
+# ─── Logging setup (console + file) ────────────────────────────────────
+_log_dir = Path(__file__).resolve().parent.parent / "logs"
+_log_dir.mkdir(exist_ok=True)
+_log_file = _log_dir / f"semantic_merge_{__import__('datetime').datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+logger = logging.getLogger("semantic_merge")
+logger.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
+
+_ch = logging.StreamHandler()
+_ch.setFormatter(_fmt)
+logger.addHandler(_ch)
+
+_fh = logging.FileHandler(_log_file, encoding="utf-8")
+_fh.setFormatter(_fmt)
+logger.addHandler(_fh)
+
+logger.info("Log file: %s", _log_file)
 
 # ─── Config ────────────────────────────────────────────────────────────
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
@@ -416,7 +432,11 @@ async def llm_cluster_merges(
                 groups = result.get("groups", [])
                 local_merges: list[tuple[EntityNode, EntityNode, str]] = []
 
-                for group in groups:
+                # Log LLM clustering result for this cluster
+                entity_names = [e.name for e in cluster]
+                merged_ids: set[int] = set()
+                logger.info("  ── Cluster %d (%d entities) ──", task_idx, len(cluster))
+                for gi, group in enumerate(groups):
                     ids = group.get("ids", [])
                     canon = group.get("canonical_name", "")
 
@@ -426,6 +446,10 @@ async def llm_cluster_merges(
                     if len(valid_ids) < 2:
                         continue
 
+                    merged_ids.update(valid_ids)
+                    group_names = [entity_names[i] for i in valid_ids]
+                    logger.info("    Group %d → '%s': %s", gi, canon, group_names)
+
                     # First valid entity is the keeper; rest are dupes
                     keeper = cluster[valid_ids[0]]
                     if not canon:
@@ -433,18 +457,19 @@ async def llm_cluster_merges(
                     for idx in valid_ids[1:]:
                         local_merges.append((keeper, cluster[idx], canon))
 
+                # Log entities that remain independent
+                independent = [entity_names[i] for i in range(len(cluster)) if i not in merged_ids]
+                if independent:
+                    logger.info("    Independent (%d): %s", len(independent),
+                                independent[:10] if len(independent) > 10
+                                else independent)
+
                 async with merge_lock:
                     merges.extend(local_merges)
                     diag["total_merges"] += len(local_merges)
 
                 if local_merges:
                     diag["has_groups"] += 1
-                    for keeper, dupe, canon in local_merges[:5]:
-                        logger.info("    ✅ MERGE: '%s' + '%s' → '%s'",
-                                    keeper.name, dupe.name, canon)
-                    if len(local_merges) > 5:
-                        logger.info("    ... and %d more merges in this cluster",
-                                    len(local_merges) - 5)
                 else:
                     diag["empty_groups"] += 1
 
