@@ -11,8 +11,6 @@ Usage:
 """
 # type: ignore
 
-from __future__ import annotations
-
 import argparse
 import asyncio
 import json
@@ -179,7 +177,7 @@ def find_similar_pairs_ann(
     # Build lookup: point_id → entity
     id_to_entity = {e.point_id: e for e in entities}
     # Track seen pairs to avoid duplicates
-    seen_pairs: set[tuple[str, str]] = set()
+    seen_pairs: set[tuple[str, ...]] = set()
     pairs: list[tuple[EntityNode, EntityNode, float]] = []
 
     for entity in entities:
@@ -230,9 +228,52 @@ def find_similar_pairs_ann(
     return pairs
 
 
-# ─── Step 4: LLM batch decision ───────────────────────────────────────
-MERGE_PROMPT = """You are an academic entity deduplication expert.
-For each pair of entity names below, decide if they refer to the SAME concept/method/task.
+# ─── Step 3b: Build clusters from ANN pairs ───────────────────────────
+def build_clusters_from_pairs(
+    pairs: list[tuple[EntityNode, EntityNode, float]],
+) -> list[list[EntityNode]]:
+    """Build connected components from ANN candidate pairs using Union-Find.
+
+    Instead of sending individual pairs to LLM, we group all entities
+    connected by ANN similarity into clusters for batch LLM evaluation.
+    """
+    parent: dict[str, str] = {}  # point_id → parent point_id
+
+    def find(x: str) -> str:
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # Build Union-Find from pairs
+    entity_map: dict[str, EntityNode] = {}
+    for a, b, _ in pairs:
+        union(a.point_id, b.point_id)
+        entity_map[a.point_id] = a
+        entity_map[b.point_id] = b
+
+    # Group by root
+    groups: dict[str, list[EntityNode]] = {}
+    for pid, entity in entity_map.items():
+        root = find(pid)
+        groups.setdefault(root, []).append(entity)
+
+    # Only return clusters with 2+ entities
+    clusters = [members for members in groups.values() if len(members) >= 2]
+    # Sort by size descending
+    clusters.sort(key=len, reverse=True)
+    return clusters
+
+
+# ─── Step 4: LLM cluster-based grouping ───────────────────────────────
+CLUSTER_PROMPT = """You are an academic entity deduplication expert.
+Below is a list of entity names that may refer to the same or different concepts.
+Group them: entities referring to the SAME concept/method/task/dataset should be in the same group.
 
 Rules:
 - "SGD" and "Stochastic Gradient Descent" → SAME (acronym vs full name)
@@ -241,118 +282,198 @@ Rules:
 - "GAN" and "Generative Adversarial Network" → SAME
 - "BERT" and "RoBERTa" → DIFFERENT (different models)
 - "Object Detection" and "Object Detection Task" → SAME (redundant suffix)
+- "Few-shot Learning" and "Few-Shot Learning" and "few shot learning" → SAME (casing/formatting)
 
-Return JSON only:
-{"decisions": [{"pair_id": 0, "same": true, "canonical_name": "preferred name"}, ...]}
+Return ONLY JSON. Each group contains the IDs of entities that are the same, plus the best canonical name.
+Omit singletons (entities that don't match any other).
 
-Pairs to evaluate:
+{"groups": [{"ids": [0, 2, 5], "canonical_name": "best name"}, {"ids": [1, 3], "canonical_name": "best name"}]}
+
+Entities to group:
 """
 
 
-async def llm_decide_merges(
-    pairs: list[tuple[EntityNode, EntityNode, float]],
-    batch_size: int = 40,
+def _parse_llm_json(content: str) -> dict | None:
+    """Extract and parse JSON from LLM response, with repair for truncated output."""
+    # 1. Strip thinking tags
+    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+    # 2. Strip code fences
+    content = re.sub(r'^```(?:json)?\s*\n?', '', content.strip())
+    content = re.sub(r'\n?```\s*$', '', content)
+    content = content.strip()
+
+    # 3. Find JSON object
+    json_match = re.search(r'\{[\s\S]*\}', content)
+    if not json_match:
+        return None
+
+    raw = json_match.group()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # 4. Try repair: strip trailing incomplete fields
+    repaired = re.sub(r',\s*"[^"]*"\s*:\s*"[^"]*$', '', raw)
+    repaired = re.sub(r',\s*"[^"]*"\s*:\s*\d*$', '', repaired)
+    repaired = re.sub(r',\s*"[^"]*$', '', repaired)
+    repaired = re.sub(r',\s*$', '', repaired)
+    # Close unclosed brackets
+    stack = []
+    in_str = False
+    esc = False
+    for ch in repaired:
+        if esc:
+            esc = False
+            continue
+        if ch == '\\':
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch in '{[':
+            stack.append(ch)
+        elif ch == '}' and stack and stack[-1] == '{':
+            stack.pop()
+        elif ch == ']' and stack and stack[-1] == '[':
+            stack.pop()
+    for opener in reversed(stack):
+        repaired += ']' if opener == '[' else '}'
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        return None
+
+
+async def llm_cluster_merges(
+    clusters: list[list[EntityNode]],
+    max_cluster_size: int = 30,
     max_concurrent: int = 32,
 ) -> list[tuple[EntityNode, EntityNode, str]]:
-    """Use LLM to decide which pairs should be merged. Runs concurrent batches."""
+    """Send entity clusters to LLM for group-based dedup decision.
+
+    Instead of asking "is A the same as B?" for each pair, we send the
+    full cluster and ask: "which of these are the same entity? group them."
+
+    Returns merge pairs compatible with execute_merges().
+    """
     client = AsyncOpenAI(base_url=LLM_BASE, api_key=LLM_KEY)
     merges: list[tuple[EntityNode, EntityNode, str]] = []
+    merge_lock = asyncio.Lock()
     sem = asyncio.Semaphore(max_concurrent)
 
-    async def process_batch(batch_idx: int, batch: list):
+    # Diagnostic counters
+    diag = {"api_errors": 0, "json_parse_failures": 0, "no_json_found": 0,
+            "empty_groups": 0, "has_groups": 0, "sample_logged": False,
+            "total_merges": 0}
+
+    # Split large clusters into manageable chunks
+    tasks_input: list[list[EntityNode]] = []
+    for cluster in clusters:
+        if len(cluster) <= max_cluster_size:
+            tasks_input.append(cluster)
+        else:
+            # Split large clusters into overlapping chunks
+            for i in range(0, len(cluster), max_cluster_size - 2):
+                chunk = cluster[i:i + max_cluster_size]
+                if len(chunk) >= 2:
+                    tasks_input.append(chunk)
+
+    async def process_cluster(task_idx: int, cluster: list[EntityNode]):
         async with sem:
-            pair_text = "\n".join([
-                f'{j}. "{a.name}" vs "{b.name}" (sim: {sim:.3f})'
-                for j, (a, b, sim) in enumerate(batch)
+            entity_text = "\n".join([
+                f'{i}. "{e.name}"' for i, e in enumerate(cluster)
             ])
-            prompt = MERGE_PROMPT + pair_text
+            prompt = CLUSTER_PROMPT + entity_text
 
             try:
                 resp = await client.chat.completions.create(
                     model=LLM_MODEL,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.1,
-                    max_tokens=2048,
+                    max_tokens=4096,
                     extra_body={"enable_thinking": False},
                 )
                 content = resp.choices[0].message.content or ""
 
-                # Clean response
-                # 1. Strip thinking tags
-                content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
-                # 2. Strip code fences (including unclosed)
-                content = re.sub(r'^```(?:json)?\s*\n?', '', content.strip())
-                content = re.sub(r'\n?```\s*$', '', content)
-                content = content.strip()
+                # Log first raw response as sample
+                if not diag["sample_logged"]:
+                    logger.info("  [DIAG] Sample LLM raw response (first 500 chars): %s",
+                                content[:500])
+                    diag["sample_logged"] = True
 
-                # 3. Try parsing
-                result = None
-                json_match = re.search(r'\{[\s\S]*\}', content)
-                if json_match:
-                    raw = json_match.group()
-                    try:
-                        result = json.loads(raw)
-                    except json.JSONDecodeError:
-                        # Try repair: strip trailing incomplete fields
-                        repaired = re.sub(r',\s*"[^"]*"\s*:\s*"[^"]*$', '', raw)
-                        repaired = re.sub(r',\s*"[^"]*"\s*:\s*\d*$', '', repaired)
-                        repaired = re.sub(r',\s*"[^"]*$', '', repaired)
-                        repaired = re.sub(r',\s*$', '', repaired)
-                        # Close unclosed brackets
-                        stack = []
-                        in_str = False
-                        esc = False
-                        for ch in repaired:
-                            if esc: esc = False; continue
-                            if ch == '\\': esc = True; continue
-                            if ch == '"': in_str = not in_str; continue
-                            if in_str: continue
-                            if ch in '{[': stack.append(ch)
-                            elif ch == '}' and stack and stack[-1] == '{': stack.pop()
-                            elif ch == ']' and stack and stack[-1] == '[': stack.pop()
-                        for opener in reversed(stack):
-                            repaired += ']' if opener == '[' else '}'
-                        try:
-                            result = json.loads(repaired)
-                        except json.JSONDecodeError:
-                            logger.debug("JSON repair failed for batch %d: %s", batch_idx, repaired[:200])
+                result = _parse_llm_json(content)
 
-                if result:
-                    decisions = result.get("decisions", [])
-                    approved = 0
-                    for dec in decisions:
-                        pid = dec.get("pair_id", -1)
-                        if 0 <= pid < len(batch) and dec.get("same", False):
-                            a, b, _ = batch[pid]
-                            canonical = dec.get("canonical_name", a.name)
-                            merges.append((a, b, canonical))
-                            approved += 1
-                            logger.info("    ✅ MERGE: '%s' + '%s' → '%s'", a.name, b.name, canonical)
-                        elif 0 <= pid < len(batch):
-                            a, b, _ = batch[pid]
-                            logger.debug("    ❌ SKIP: '%s' ≠ '%s'", a.name, b.name)
-                    nonlocal completed_batches
-                    completed_batches += 1
-                    logger.info("  Batch %d done: %d/%d approved  [%d/%d batches]",
-                                batch_idx, approved, len(decisions),
-                                completed_batches, total_batches)
+                if result is None:
+                    diag["no_json_found"] += 1
+                    logger.info("  [DIAG] No JSON in cluster %d (first 300 chars): %s",
+                                task_idx, content[:300])
+                    return
+
+                groups = result.get("groups", [])
+                local_merges: list[tuple[EntityNode, EntityNode, str]] = []
+
+                for group in groups:
+                    ids = group.get("ids", [])
+                    canon = group.get("canonical_name", "")
+
+                    # Validate: need >=2 valid IDs
+                    valid_ids = [i for i in ids
+                                 if isinstance(i, int) and 0 <= i < len(cluster)]
+                    if len(valid_ids) < 2:
+                        continue
+
+                    # First valid entity is the keeper; rest are dupes
+                    keeper = cluster[valid_ids[0]]
+                    if not canon:
+                        canon = keeper.name
+                    for idx in valid_ids[1:]:
+                        local_merges.append((keeper, cluster[idx], canon))
+
+                async with merge_lock:
+                    merges.extend(local_merges)
+                    diag["total_merges"] += len(local_merges)
+
+                if local_merges:
+                    diag["has_groups"] += 1
+                    for keeper, dupe, canon in local_merges[:5]:
+                        logger.info("    ✅ MERGE: '%s' + '%s' → '%s'",
+                                    keeper.name, dupe.name, canon)
+                    if len(local_merges) > 5:
+                        logger.info("    ... and %d more merges in this cluster",
+                                    len(local_merges) - 5)
                 else:
-                    logger.debug("No JSON found in LLM batch %d response: %s", batch_idx, content[:150])
+                    diag["empty_groups"] += 1
+
+                progress["done"] += 1
+                if progress["done"] % 100 == 0 or progress["done"] == total_tasks:
+                    logger.info("  Progress: %d/%d clusters done, %d merges so far",
+                                progress["done"], total_tasks, diag["total_merges"])
+
             except Exception as e:
-                logger.warning("LLM batch %d failed: %s", batch_idx, e)
+                diag["api_errors"] += 1
+                logger.warning("Cluster %d failed: %s", task_idx, e)
 
     # Create all tasks
-    completed_batches = 0
+    progress = {"done": 0}
     tasks = []
-    for i in range(0, len(pairs), batch_size):
-        batch = pairs[i:i + batch_size]
-        tasks.append(process_batch(i, batch))
+    for i, cluster in enumerate(tasks_input):
+        tasks.append(process_cluster(i, cluster))
 
-    # Run with progress logging
-    total_batches = len(tasks)
-    logger.info("  Dispatching %d LLM batches (%d concurrent)...", total_batches, max_concurrent)
+    total_tasks = len(tasks)
+    logger.info("  Dispatching %d cluster tasks (%d concurrent, max_size=%d)...",
+                total_tasks, max_concurrent, max_cluster_size)
     await asyncio.gather(*tasks)
-    logger.info("  LLM approved %d merges from %d pairs", len(merges), len(pairs))
+
+    logger.info("  LLM approved %d merges from %d clusters (%d tasks after splitting)",
+                len(merges), len(clusters), total_tasks)
+    logger.info("  [DIAG] api_errors=%d  json_failures=%d  no_json=%d  "
+                "empty_groups=%d  has_groups=%d",
+                diag["api_errors"], diag["json_parse_failures"], diag["no_json_found"],
+                diag["empty_groups"], diag["has_groups"])
 
     await client.close()
     return merges
@@ -506,7 +627,7 @@ def _normalize_name(name: str) -> str:
 def exact_merge(driver, entity_type: str, dry_run: bool = False) -> tuple[int, list[str]]:
     """Merge entities with identical normalized names. No LLM needed.
     Returns (merged_count, deleted_entity_ids)."""
-    merged = 0
+    merged: int = 0
     deleted_entity_ids: list[str] = []
     with driver.session() as s:
         # Load all entities
@@ -539,7 +660,7 @@ def exact_merge(driver, entity_type: str, dry_run: bool = False) -> tuple[int, l
                 if len(dupes) <= 3:
                     names = [n for _, n, _ in dupes]
                     logger.debug("  [DRY-RUN] Merge: '%s' ← %s", keeper_name, names)
-                merged += len(dupes)
+                merged += len(dupes)  # type: ignore[operator]
                 deleted_entity_ids.extend(eid for _, _, eid in dupes if eid)
                 continue
 
@@ -594,7 +715,7 @@ def exact_merge(driver, entity_type: str, dry_run: bool = False) -> tuple[int, l
             """, dids=dupe_neo_ids)
 
             deleted_entity_ids.extend(eid for _, _, eid in dupes if eid)
-            merged += len(dupes)
+            merged += len(dupes)  # type: ignore[operator]
 
             if merged % 1000 == 0 and merged > 0:
                 logger.info("  Phase 0: Merged %d duplicates so far...", merged)
@@ -664,15 +785,24 @@ async def process_entity_type(
         return {"type": entity_type, "total": len(entities), "pairs": 0,
                 "exact_merged": exact_merged, "semantic_merged": 0}
 
-    # Log top pairs
-    for a, b, sim in pairs[:15]:
-        logger.info("    %.3f: '%s' <-> '%s'", sim, a.name, b.name)
-    if len(pairs) > 15:
-        logger.info("    ... and %d more pairs", len(pairs) - 15)
+    # Step 3b: Build clusters from ANN pairs
+    clusters = build_clusters_from_pairs(pairs)
+    sizes = [len(c) for c in clusters]
+    logger.info("  Built %d clusters from %d pairs (max=%d, median=%d, total_entities=%d)",
+                len(clusters), len(pairs),
+                max(sizes) if sizes else 0,
+                sorted(sizes)[len(sizes) // 2] if sizes else 0,
+                sum(sizes))
 
-    # Step 4: LLM decision
-    logger.info("  Sending %d pairs to LLM for merge decision...", len(pairs))
-    merges = await llm_decide_merges(pairs)
+    # Log top pairs for reference
+    for a, b, sim in pairs[:10]:
+        logger.info("    %.3f: '%s' <-> '%s'", sim, a.name, b.name)
+    if len(pairs) > 10:
+        logger.info("    ... and %d more pairs", len(pairs) - 10)
+
+    # Step 4: LLM cluster-based grouping
+    logger.info("  Sending %d clusters to LLM for grouping...", len(clusters))
+    merges = await llm_cluster_merges(clusters)
 
     # Step 5: Execute
     prefix = "[DRY-RUN] " if dry_run else ""
